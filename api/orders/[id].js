@@ -8,6 +8,7 @@
  */
 
 import { sql } from "../../lib/db.js";
+import { requireAuth } from "../../middleware/auth.js";
 
 const ALLOWED_ORDER_STATUSES = [
   "New",
@@ -27,7 +28,10 @@ function setCorsHeaders(res) {
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, DELETE, OPTIONS"
   );
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
 }
 
 /** Send a JSON response with the given status code. */
@@ -105,6 +109,9 @@ export default async function handler(req, res) {
     }
 
     if (req.method === "PUT") {
+      // Admin only — update order status
+      if (!requireAuth(req, res)) return;
+
       const body = parseBody(req);
       if (body === null) {
         return json(res, 400, {
@@ -178,6 +185,9 @@ export default async function handler(req, res) {
     }
 
     if (req.method === "DELETE") {
+      // Admin only — delete order
+      if (!requireAuth(req, res)) return;
+
       const { rows } = await sql`
         DELETE FROM orders
         WHERE id = ${id}

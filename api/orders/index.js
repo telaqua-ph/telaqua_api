@@ -7,6 +7,7 @@
  */
 
 import { sql } from "../../lib/db.js";
+import { requireAuth } from "../../middleware/auth.js";
 
 /** Apply CORS headers for browser clients. */
 function setCorsHeaders(res) {
@@ -15,7 +16,10 @@ function setCorsHeaders(res) {
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, DELETE, OPTIONS"
   );
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
 }
 
 /** Send a JSON response with the given status code. */
@@ -142,6 +146,9 @@ export default async function handler(req, res) {
 
   try {
     if (req.method === "GET") {
+      // Admin only — list orders
+      if (!requireAuth(req, res)) return;
+
       const { rows } = await sql`
         SELECT *
         FROM orders
