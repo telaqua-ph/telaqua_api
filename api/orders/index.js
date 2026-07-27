@@ -192,45 +192,51 @@ export default async function handler(req, res) {
         });
       }
 
-      // Insert order, then set unique order_number from the serial id (TAQ-000001)
-      const { rows } = await sql`
-        WITH inserted AS (
-          INSERT INTO orders (
-            customer_name,
-            phone,
-            email,
-            address,
-            city,
-            state,
-            pincode,
-            quantity,
-            unit_price,
-            total_amount,
-            payment_method,
-            payment_status,
-            order_status
-          ) VALUES (
-            ${orderData.customer_name},
-            ${orderData.phone},
-            ${orderData.email},
-            ${orderData.address},
-            ${orderData.city},
-            ${orderData.state},
-            ${orderData.pincode},
-            ${orderData.quantity},
-            ${orderData.unit_price},
-            ${orderData.total_amount},
-            ${orderData.payment_method},
-            'Pending',
-            'New'
-          )
-          RETURNING id
+      // Step 1: Insert the order and get the new id
+      const { rows: inserted } = await sql`
+        INSERT INTO orders (
+          customer_name,
+          phone,
+          email,
+          address,
+          city,
+          state,
+          pincode,
+          quantity,
+          unit_price,
+          total_amount,
+          payment_method,
+          payment_status,
+          order_status
+        ) VALUES (
+          ${orderData.customer_name},
+          ${orderData.phone},
+          ${orderData.email},
+          ${orderData.address},
+          ${orderData.city},
+          ${orderData.state},
+          ${orderData.pincode},
+          ${orderData.quantity},
+          ${orderData.unit_price},
+          ${orderData.total_amount},
+          ${orderData.payment_method},
+          'Pending',
+          'New'
         )
-        UPDATE orders o
-        SET order_number = 'TAQ-' || LPAD(inserted.id::text, 6, '0')
-        FROM inserted
-        WHERE o.id = inserted.id
-        RETURNING o.*
+        RETURNING id
+      `;
+
+      const id = inserted[0].id;
+
+      // Step 2: Generate order number in JavaScript (TAQ-000001)
+      const orderNumber = `TAQ-${String(id).padStart(6, "0")}`;
+
+      // Step 3: Update the same row with the order number
+      const { rows } = await sql`
+        UPDATE orders
+        SET order_number = ${orderNumber}
+        WHERE id = ${id}
+        RETURNING *
       `;
 
       return json(res, 201, {
