@@ -1,15 +1,16 @@
 /**
- * api/auth/login.js
+ * api/auth/change-password.js
  *
- * POST /api/auth/login
+ * PUT /api/auth/change-password
  *
- * Authenticates an admin against the PostgreSQL admins table
- * and returns a JWT signed with process.env.JWT_SECRET (24h expiry).
+ * Allows the authenticated admin to change their password.
  */
 
 import bcrypt from "bcryptjs";
 import { sql } from "../../lib/db.js";
-import { signToken } from "../../lib/auth.js";
+import { requireAuth } from "../../middleware/auth.js";
+
+const BCRYPT_SALT_ROUNDS = 12;
 
 /** Apply CORS headers for browser clients. */
 function setCorsHeaders(res) {
@@ -53,10 +54,20 @@ export default async function handler(req, res) {
     return;
   }
 
-  if (req.method !== "POST") {
+  if (req.method !== "PUT") {
     return json(res, 405, {
       success: false,
       message: "Method not allowed",
+    });
+  }
+
+  if (!requireAuth(req, res)) return;
+
+  const adminId = req.user?.admin_id;
+  if (!adminId) {
+    return json(res, 401, {
+      success: false,
+      message: "Unauthorized",
     });
   }
 
@@ -69,68 +80,76 @@ export default async function handler(req, res) {
       });
     }
 
-    const email =
-      typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-    const password =
-      typeof body.password === "string" ? body.password : "";
+    const current_password =
+      typeof body.current_password === "string" ? body.current_password : "";
+    const new_password =
+      typeof body.new_password === "string" ? body.new_password : "";
+    const confirm_password =
+      typeof body.confirm_password === "string" ? body.confirm_password : "";
 
-    if (!email || !password) {
+    if (!current_password || !new_password || !confirm_password) {
       return json(res, 400, {
         success: false,
-        message: "email and password are required",
+        message:
+          "current_password, new_password, and confirm_password are required",
       });
     }
 
-    // Look up active admin by email
+    if (new_password !== confirm_password) {
+      return json(res, 400, {
+        success: false,
+        message: "new_password and confirm_password do not match",
+      });
+    }
+
+    if (new_password.length < 8) {
+      return json(res, 400, {
+        success: false,
+        message: "new_password must be at least 8 characters",
+      });
+    }
+
     const { rows } = await sql`
-      SELECT id, full_name, username, email, password_hash
+      SELECT id, password_hash
       FROM admins
-      WHERE email = ${email}
+      WHERE id = ${adminId}
         AND is_active = true
       LIMIT 1
     `;
 
     if (rows.length === 0) {
-      return json(res, 401, {
+      return json(res, 404, {
         success: false,
-        message: "Invalid email or password",
+        message: "Admin not found",
       });
     }
 
     const admin = rows[0];
-    const isMatch = await bcrypt.compare(password, admin.password_hash);
+    const isMatch = await bcrypt.compare(current_password, admin.password_hash);
 
     if (!isMatch) {
       return json(res, 401, {
         success: false,
-        message: "Invalid email or password",
+        message: "Current password is incorrect",
       });
     }
 
-    // Record successful login
+    const password_hash = await bcrypt.hash(new_password, BCRYPT_SALT_ROUNDS);
+
     await sql`
       UPDATE admins
-      SET last_login = CURRENT_TIMESTAMP
-      WHERE id = ${admin.id}
+      SET
+        password_hash = ${password_hash},
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ${adminId}
     `;
-
-    const token = signToken({
-      admin_id: admin.id,
-      email: admin.email,
-    });
 
     return json(res, 200, {
       success: true,
-      token,
-      admin: {
-        id: admin.id,
-        full_name: admin.full_name,
-        username: admin.username,
-        email: admin.email,
-      },
+      message: "Password changed successfully",
     });
   } catch (error) {
-    console.error("Login API error:", error);
+    console.error("Change password API error:", error);
     return json(res, 500, {
       success: false,
       message: "Internal server error",
