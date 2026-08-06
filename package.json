@@ -17,6 +17,7 @@
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
     "jsonwebtoken": "^9.0.3",
+    "razorpay": "^2.9.8",
     "zod": "^3.25.76"
   },
   "devDependencies": {
