@@ -2,9 +2,8 @@
  * api/orders/[id].js
  *
  * /api/orders/:id
- * - GET    — fetch a single order by id
- * - PUT    — update order_status and/or payment_status
- * - DELETE — remove an order by id
+ * - GET — fetch a single order by id
+ * - PUT — update order_status and/or payment_status
  */
 
 import { sql } from "../../lib/db.js";
@@ -181,29 +180,6 @@ export default async function handler(req, res) {
         success: true,
         message: "Order updated successfully",
         order: rows[0],
-      });
-    }
-
-    if (req.method === "DELETE") {
-      // Admin only — delete order
-      if (!requireAuth(req, res)) return;
-
-      const { rows } = await sql`
-        DELETE FROM orders
-        WHERE id = ${id}
-        RETURNING id
-      `;
-
-      if (rows.length === 0) {
-        return json(res, 404, {
-          success: false,
-          message: "Order not found",
-        });
-      }
-
-      return json(res, 200, {
-        success: true,
-        message: "Order deleted successfully",
       });
     }
 
