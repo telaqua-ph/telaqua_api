@@ -21,8 +21,25 @@
 import Razorpay from "razorpay";
 import { sql } from "../../lib/db.js";
 
-/** Fixed Tel-Aqua Digital pH Meter unit price in INR (₹19,999). */
-const UNIT_PRICE_INR = 19999;
+/**
+ * Server-side pricing (never trust frontend amounts).
+ *
+ * PRODUCT_PRICE  — selling price per unit (₹2,499)
+ * COUPON_CODE    — only valid coupon today
+ * COUPON_DISCOUNT — flat ₹500 off per unit when coupon applies
+ *
+ * Final unit price:
+ *   SAVE500 → 2499 - 500 = 1999
+ *   otherwise → 2499
+ *
+ * To change the product price later: update PRODUCT_PRICE.
+ * To add more coupons later: expand into a map, e.g.
+ *   const COUPONS = { SAVE500: 500, SAVE1000: 1000 };
+ *   then look up discount by coupon_code.
+ */
+const PRODUCT_PRICE = 2499;
+const COUPON_CODE = "SAVE500";
+const COUPON_DISCOUNT = 500;
 
 /** Apply CORS headers for browser clients. */
 function setCorsHeaders(res) {
@@ -86,6 +103,11 @@ function validateCreatePaymentOrder(body) {
   const state = trimStr(body.state);
   const pincode = trimStr(body.pincode);
   const quantity = Number(body.quantity);
+  // Optional coupon — normalize to uppercase for case-insensitive match
+  const coupon_code =
+    body.coupon_code !== undefined && body.coupon_code !== null && body.coupon_code !== ""
+      ? String(trimStr(body.coupon_code)).toUpperCase()
+      : null;
 
   // --- Required field checks ---
   if (!customer_name) {
@@ -125,9 +147,13 @@ function validateCreatePaymentOrder(body) {
     return { error: "quantity must be an integer greater than 0" };
   }
 
-  // --- Server-side pricing (ignore any client-sent prices) ---
-  const unit_price = UNIT_PRICE_INR;
-  const total_amount = UNIT_PRICE_INR * quantity;
+  // --- Server-side pricing (ignore any client-sent unit_price / total_amount) ---
+  // With SAVE500 → ₹1,999 per unit; otherwise → ₹2,499 per unit
+  const unit_price =
+    coupon_code === COUPON_CODE
+      ? PRODUCT_PRICE - COUPON_DISCOUNT
+      : PRODUCT_PRICE;
+  const total_amount = unit_price * quantity;
 
   return {
     data: {
@@ -139,6 +165,7 @@ function validateCreatePaymentOrder(body) {
       state,
       pincode: String(pincode),
       quantity,
+      coupon_code,
       unit_price,
       total_amount,
     },
@@ -214,7 +241,7 @@ export default async function handler(req, res) {
     const orderData = validation.data;
 
     // Step 2: Convert INR total to paise (Razorpay's required unit)
-    // Example: ₹19,999 → 1,999,900 paise
+    // Example: ₹2,499 × 1 → 249900 paise; ₹1,999 × 2 → 399800 paise
     const amountInPaise = Math.round(orderData.total_amount * 100);
     const receipt = generateReceipt();
 
@@ -229,6 +256,8 @@ export default async function handler(req, res) {
         phone: orderData.phone,
         email: orderData.email,
         quantity: String(orderData.quantity),
+        coupon_code: orderData.coupon_code || "",
+        unit_price: String(orderData.unit_price),
       },
     });
 
