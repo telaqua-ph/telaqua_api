@@ -4,6 +4,7 @@
   "description": "Production-ready REST API for Tel-Aqua — Node.js + Express",
   "private": true,
   "type": "module",
+  "main": "server.js",
   "engines": {
     "node": ">=18"
   },

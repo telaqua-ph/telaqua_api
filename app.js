@@ -20,11 +20,47 @@ import promoRoutes from "./routes/promo.js";
 
 const app = express();
 
+function buildCorsOrigin() {
+  const frontendUrl = (process.env.FRONTEND_URL || "").trim();
+  const corsOrigins = (process.env.CORS_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const allowlist = new Set(
+    [
+      ...corsOrigins,
+      frontendUrl,
+      // Local development only
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1:3000",
+    ].filter(Boolean)
+  );
+
+  // If no production origins configured, reflect request origin (dev-friendly)
+  if (!frontendUrl && corsOrigins.length === 0) {
+    return true;
+  }
+
+  return (origin, callback) => {
+    // Non-browser clients (Postman, server-to-server) often send no Origin
+    if (!origin) {
+      return callback(null, true);
+    }
+    if (allowlist.has(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, false);
+  };
+}
+
 app.use(helmet());
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use(
   cors({
-    origin: true,
+    origin: buildCorsOrigin(),
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: [
@@ -41,13 +77,20 @@ app.use(
     ],
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// Health check
+// Health checks — must not depend on DB, Razorpay, or Delhivery
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
     message: "Tel-Aqua API is running",
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Tel-Aqua API is healthy",
   });
 });
 
@@ -73,7 +116,19 @@ app.use((req, res) => {
 
 // Error handler
 app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
+  console.error("Unhandled error:", {
+    message: err?.message,
+    code: err?.code,
+    path: req?.path,
+  });
+
+  if (err?.code === "DB_CONFIG_ERROR") {
+    return res.status(503).json({
+      success: false,
+      message: "Database is not configured",
+    });
+  }
+
   res.status(500).json({
     success: false,
     message: "Internal server error",
