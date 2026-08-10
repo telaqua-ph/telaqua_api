@@ -1,0 +1,1669 @@
+/**
+ * controllers/deliveryController.js
+ *
+ * Delhivery delivery endpoints:
+ * - Pincode serviceability
+ * - Expected TAT
+ * - Waybill / AWB bulk fetch
+ * - Rate calculator
+ * - Client warehouse create
+ * - Shipment create
+ * - Shipment update / edit
+ * - Shipment tracking
+ * - Packing slip / shipping label
+ * - Pickup request
+ * - NDR update
+ */
+
+import {
+  checkPincodeServiceability,
+  getExpectedTat,
+  getWaybills,
+  getShippingRate,
+  createClientWarehouse,
+  createShipment,
+  updateShipment,
+  trackShipment,
+  generateShippingLabel,
+  requestPickup,
+  updateNdr,
+} from "../services/delhiveryService.js";
+import { query } from "../config/db.js";
+
+/** Sensible upper bound for bulk waybill requests. */
+const MAX_WAYBILL_COUNT = 100;
+
+/** Max chargeable weight in grams (50 kg). */
+const MAX_CGM = 50000;
+
+const ALLOWED_MD = ["E", "S"];
+/** Delhivery Invoice Charge API: Delivered, RTO, DTO only. */
+const ALLOWED_SS = ["Delivered", "RTO", "DTO"];
+
+/** Exact Client Warehouse Create fields allowed by Delhivery. */
+const WAREHOUSE_FIELDS = [
+  "name",
+  "registered_name",
+  "address",
+  "city",
+  "pin",
+  "phone",
+  "email",
+  "country",
+  "return_address",
+  "return_pin",
+  "return_city",
+  "return_state",
+  "return_country",
+];
+
+/**
+ * Delhivery Edit Order API — keys that can be updated (besides required waybill).
+ * Docs: name, add, phone, cod, gm, shipment_length/width/height, product_details, pt
+ */
+const SHIPMENT_UPDATE_OPTIONAL_FIELDS = [
+  "name",
+  "add",
+  "phone",
+  "cod",
+  "gm",
+  "shipment_length",
+  "shipment_width",
+  "shipment_height",
+  "product_details",
+  "pt",
+];
+
+const ALLOWED_PAYMENT_MODES_PT = ["COD", "Pre-paid", "Prepaid", "Pickup"];
+
+/** Delhivery rejects these characters in CMU payloads unless JSON-escaped carefully. */
+const DELHIVERY_FORBIDDEN_CHARS = /[&#%;\\]/g;
+
+/**
+ * Map Delhivery service errors to HTTP responses.
+ * Never exposes tokens or stack traces.
+ */
+function handleDelhiveryError(res, error, contextLabel) {
+  console.error(`${contextLabel} error:`, {
+    code: error?.code,
+    status: error?.status,
+    message: error?.message,
+  });
+
+  if (error?.code === "DELHIVERY_CONFIG_ERROR") {
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Delhivery is not configured",
+    });
+  }
+
+  if (error?.code === "DELHIVERY_NETWORK_ERROR") {
+    return res.status(502).json({
+      success: false,
+      message: "Delhivery service is currently unavailable",
+    });
+  }
+
+  if (error?.code === "DELHIVERY_INVALID_RESPONSE") {
+    return res.status(502).json({
+      success: false,
+      message: "Delhivery returned an invalid or unexpected response",
+    });
+  }
+
+  if (error?.code === "DELHIVERY_UPSTREAM_ERROR") {
+    const status = error.status;
+    const upstreamMessage =
+      typeof error.message === "string" &&
+      error.message &&
+      !error.message.startsWith("Delhivery API returned HTTP")
+        ? error.message
+        : null;
+
+    if (status === 401) {
+      return res.status(401).json({
+        success: false,
+        message: "Delhivery authentication failed",
+      });
+    }
+
+    if (status === 403) {
+      return res.status(403).json({
+        success: false,
+        message: "Delhivery permission denied",
+      });
+    }
+
+    if (status === 404) {
+      return res.status(404).json({
+        success: false,
+        message: "Delhivery route or resource is unavailable",
+      });
+    }
+
+    if (status === 409) {
+      return res.status(409).json({
+        success: false,
+        message: upstreamMessage || "Conflict with existing Delhivery resource",
+        ...(error.upstreamBody ? { data: error.upstreamBody } : {}),
+      });
+    }
+
+    if (status === 429) {
+      return res.status(429).json({
+        success: false,
+        message: "Delhivery rate limit exceeded. Please try again later.",
+      });
+    }
+
+    if (status === 422) {
+      return res.status(422).json({
+        success: false,
+        message: upstreamMessage || "Invalid shipment payload for Delhivery",
+        ...(error.upstreamBody ? { data: error.upstreamBody } : {}),
+      });
+    }
+
+    if (status === 400) {
+      const msg = (
+        upstreamMessage ||
+        JSON.stringify(error.upstreamBody || {})
+      ).toLowerCase();
+      const looksLikeDuplicate =
+        msg.includes("already exists") ||
+        msg.includes("already exist") ||
+        msg.includes("duplicate");
+
+      if (looksLikeDuplicate) {
+        return res.status(409).json({
+          success: false,
+          message: upstreamMessage || "Resource already exists in Delhivery",
+          ...(error.upstreamBody ? { data: error.upstreamBody } : {}),
+        });
+      }
+
+      return res.status(400).json({
+        success: false,
+        message: upstreamMessage || "Invalid data for Delhivery",
+        ...(error.upstreamBody ? { data: error.upstreamBody } : {}),
+      });
+    }
+
+    if (status >= 500) {
+      return res.status(502).json({
+        success: false,
+        message: "Delhivery service is currently unavailable",
+      });
+    }
+
+    return res.status(502).json({
+      success: false,
+      message: "Unable to complete Delhivery request",
+    });
+  }
+
+  return res.status(500).json({
+    success: false,
+    message: "Internal server error",
+  });
+}
+
+/**
+ * Require a non-empty trimmed string field from the request body.
+ * @param {object} body
+ * @param {string} field
+ * @returns {{ ok: true, value: string } | { ok: false, message: string }}
+ */
+function requireStringField(body, field) {
+  const raw = body?.[field];
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return { ok: false, message: `${field} is required` };
+  }
+  return { ok: true, value: String(raw).trim() };
+}
+
+/**
+ * Sanitize free-text for Delhivery CMU (strip characters Delhivery rejects).
+ * @param {string} value
+ * @returns {string}
+ */
+function sanitizeDelhiveryText(value) {
+  return String(value ?? "")
+    .replace(DELHIVERY_FORBIDDEN_CHARS, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Map Telaqua payment_method to Delhivery payment_mode.
+ * Docs: COD or Pre-paid for forward shipments.
+ * @param {string} paymentMethod
+ * @returns {"COD"|"Pre-paid"|null}
+ */
+function mapPaymentMode(paymentMethod) {
+  const method = String(paymentMethod || "").trim().toLowerCase();
+  if (!method) return null;
+
+  if (
+    method === "cod" ||
+    method === "cash on delivery" ||
+    method === "cash_on_delivery"
+  ) {
+    return "COD";
+  }
+
+  // Razorpay and other prepaid/online methods
+  if (
+    method === "razorpay" ||
+    method === "prepaid" ||
+    method === "pre-paid" ||
+    method === "online" ||
+    method === "upi" ||
+    method === "card"
+  ) {
+    return "Pre-paid";
+  }
+
+  return null;
+}
+
+/**
+ * Read required shipment config from env (warehouse name + product weight).
+ * @returns {{ ok: true, config: object } | { ok: false, message: string }}
+ */
+function getShipmentConfig() {
+  const warehouseName = (process.env.TELAQUA_WAREHOUSE_NAME || "").trim();
+  const productName = (
+    process.env.TELAQUA_PRODUCT_NAME ||
+    "Tel-Aqua Product"
+  ).trim();
+  const weightRaw = (process.env.TELAQUA_PRODUCT_WEIGHT_GM || "").trim();
+
+  if (!warehouseName) {
+    return {
+      ok: false,
+      message:
+        "TELAQUA_WAREHOUSE_NAME is not configured. Set it to the exact Delhivery warehouse/pickup location name.",
+    };
+  }
+
+  if (!weightRaw || !/^\d+$/.test(weightRaw) || Number(weightRaw) <= 0) {
+    return {
+      ok: false,
+      message:
+        "TELAQUA_PRODUCT_WEIGHT_GM is not configured. Set a positive integer package weight in grams before creating shipments.",
+    };
+  }
+
+  const weightGm = Number(weightRaw);
+  if (weightGm > MAX_CGM) {
+    return {
+      ok: false,
+      message: `TELAQUA_PRODUCT_WEIGHT_GM cannot exceed ${MAX_CGM} grams`,
+    };
+  }
+
+  return {
+    ok: true,
+    config: {
+      warehouseName,
+      productName: sanitizeDelhiveryText(productName) || "Tel-Aqua Product",
+      weightGm,
+      warehousePhone: (process.env.TELAQUA_WAREHOUSE_PHONE || "").trim(),
+      warehouseAddress: (process.env.TELAQUA_WAREHOUSE_ADDRESS || "").trim(),
+      warehouseCity: (process.env.TELAQUA_WAREHOUSE_CITY || "").trim(),
+      warehouseState: (process.env.TELAQUA_WAREHOUSE_STATE || "").trim(),
+      warehousePincode: (process.env.TELAQUA_WAREHOUSE_PINCODE || "").trim(),
+    },
+  };
+}
+
+/**
+ * Build Delhivery CMU shipment payload from a Telaqua order + config.
+ * Waybill omitted so Delhivery auto-assigns (documented for single-piece).
+ * @param {object} order
+ * @param {object} config
+ * @param {"COD"|"Pre-paid"} paymentMode
+ */
+function buildShipmentPayload(order, config, paymentMode) {
+  const totalAmount = Number(order.total_amount);
+  const quantity = Number(order.quantity);
+
+  const shipment = {
+    name: sanitizeDelhiveryText(order.customer_name),
+    add: sanitizeDelhiveryText(order.address),
+    pin: String(order.pincode).trim(),
+    city: sanitizeDelhiveryText(order.city),
+    state: sanitizeDelhiveryText(order.state),
+    country: "India",
+    phone: String(order.phone).trim(),
+    order: String(order.order_number).trim(),
+    payment_mode: paymentMode,
+    products_desc: config.productName,
+    quantity: String(quantity),
+    total_amount: totalAmount,
+    weight: `${config.weightGm}`,
+  };
+
+  if (paymentMode === "COD") {
+    shipment.cod_amount = String(totalAmount);
+  }
+
+  // Optional return-to-warehouse fields when fully configured
+  if (
+    config.warehouseAddress &&
+    config.warehouseCity &&
+    config.warehouseState &&
+    config.warehousePincode &&
+    /^\d{6}$/.test(config.warehousePincode)
+  ) {
+    shipment.return_add = sanitizeDelhiveryText(config.warehouseAddress);
+    shipment.return_city = sanitizeDelhiveryText(config.warehouseCity);
+    shipment.return_state = sanitizeDelhiveryText(config.warehouseState);
+    shipment.return_pin = config.warehousePincode;
+    shipment.return_country = "India";
+    if (config.warehousePhone) {
+      shipment.return_phone = config.warehousePhone;
+    }
+  }
+
+  return {
+    pickup_location: {
+      name: config.warehouseName,
+    },
+    shipments: [shipment],
+  };
+}
+
+/**
+ * Interpret Delhivery CMU create.json soft-failure responses (HTTP 200).
+ * @param {any} data
+ * @returns {{ ok: true } | { ok: false, status: number, message: string }}
+ */
+function interpretShipmentCreateResult(data) {
+  if (!data || typeof data !== "object") {
+    return {
+      ok: false,
+      status: 502,
+      message: "Delhivery returned an invalid or unexpected response",
+    };
+  }
+
+  const packageRemarks = Array.isArray(data.packages)
+    ? data.packages
+        .map((pkg) => pkg?.remarks || pkg?.remark || pkg?.status)
+        .filter(Boolean)
+        .join("; ")
+    : "";
+
+  const combined = `${data.rmk || ""} ${packageRemarks} ${
+    typeof data.error === "string" ? data.error : ""
+  }`.toLowerCase();
+
+  const looksDuplicate =
+    combined.includes("duplicate") ||
+    combined.includes("already exists") ||
+    combined.includes("already exist");
+
+  if (data.success === false || data.error === true) {
+    const message =
+      packageRemarks ||
+      (typeof data.rmk === "string" && data.rmk) ||
+      "Unable to create Delhivery shipment";
+
+    return {
+      ok: false,
+      status: looksDuplicate ? 409 : 400,
+      message,
+    };
+  }
+
+  if (Array.isArray(data.packages)) {
+    const failed = data.packages.find((pkg) => {
+      const status = String(pkg?.status || "").toLowerCase();
+      const remarks = String(pkg?.remarks || pkg?.remark || "").toLowerCase();
+      return (
+        status === "fail" ||
+        status === "failed" ||
+        remarks.includes("fail") ||
+        remarks.includes("duplicate")
+      );
+    });
+
+    if (failed) {
+      const message =
+        failed.remarks ||
+        failed.remark ||
+        "Unable to create Delhivery shipment";
+      const msg = String(message).toLowerCase();
+      return {
+        ok: false,
+        status:
+          msg.includes("duplicate") || msg.includes("already") ? 409 : 400,
+        message,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * GET /api/delivery/serviceability/:pincode
+ * (also available under /api/delhivery/...)
+ */
+export async function checkPincode(req, res) {
+  try {
+    const pincode = String(req.params.pincode ?? "").trim();
+
+    if (!pincode || !/^\d{6}$/.test(pincode)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid pincode. Pincode must be exactly 6 digits.",
+      });
+    }
+
+    const data = await checkPincodeServiceability(pincode);
+
+    return res.status(200).json({
+      success: true,
+      pincode,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery serviceability");
+  }
+}
+
+/**
+ * GET /api/delhivery/tat?origin_pin=&destination_pin=&mot=
+ * Also available under /api/delivery/tat
+ */
+export async function checkTat(req, res) {
+  try {
+    const origin_pin = String(req.query.origin_pin ?? "").trim();
+    const destination_pin = String(req.query.destination_pin ?? "").trim();
+    // Default to surface mode "S" when omitted (Delhivery common default)
+    const motRaw = req.query.mot;
+    const mot =
+      motRaw === undefined || motRaw === null || String(motRaw).trim() === ""
+        ? "S"
+        : String(motRaw).trim().toUpperCase();
+
+    if (!origin_pin || !/^\d{6}$/.test(origin_pin)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid origin_pin. origin_pin must be exactly 6 digits.",
+      });
+    }
+
+    if (!destination_pin || !/^\d{6}$/.test(destination_pin)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid destination_pin. destination_pin must be exactly 6 digits.",
+      });
+    }
+
+    if (!mot) {
+      return res.status(400).json({
+        success: false,
+        message: "mot is required",
+      });
+    }
+
+    const data = await getExpectedTat({
+      origin_pin,
+      destination_pin,
+      mot,
+    });
+
+    return res.status(200).json({
+      success: true,
+      origin_pin,
+      destination_pin,
+      mot,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery TAT");
+  }
+}
+
+/**
+ * GET /api/delhivery/waybill?count=
+ * Also available under /api/delivery/waybill
+ *
+ * Requests waybill/AWB numbers from Delhivery only.
+ * Does NOT write to the orders table.
+ */
+export async function fetchWaybills(req, res) {
+  try {
+    const raw = req.query.count;
+
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+      return res.status(400).json({
+        success: false,
+        message: "count is required",
+      });
+    }
+
+    const countStr = String(raw).trim();
+
+    // Reject decimals / non-integers / non-numeric
+    if (!/^\d+$/.test(countStr)) {
+      return res.status(400).json({
+        success: false,
+        message: "count must be a positive integer",
+      });
+    }
+
+    const count = Number(countStr);
+
+    if (!Number.isInteger(count) || count <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "count must be a positive integer greater than 0",
+      });
+    }
+
+    if (count > MAX_WAYBILL_COUNT) {
+      return res.status(400).json({
+        success: false,
+        message: `count cannot exceed ${MAX_WAYBILL_COUNT}`,
+      });
+    }
+
+    const data = await getWaybills(count);
+
+    return res.status(200).json({
+      success: true,
+      count,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery waybill");
+  }
+}
+
+/**
+ * GET /api/delhivery/rate?md=&cgm=&o_pin=&d_pin=&ss=
+ * Also available under /api/delivery/rate
+ *
+ * Calculates estimated shipping charge via Delhivery.
+ * Does NOT write to the orders table.
+ */
+export async function calculateRate(req, res) {
+  try {
+    const md = String(req.query.md ?? "").trim().toUpperCase();
+    const cgmRaw = String(req.query.cgm ?? "").trim();
+    const o_pin = String(req.query.o_pin ?? "").trim();
+    const d_pin = String(req.query.d_pin ?? "").trim();
+    const ss = String(req.query.ss ?? "").trim();
+
+    if (!md) {
+      return res.status(400).json({
+        success: false,
+        message: "md is required (E for Express, S for Surface)",
+      });
+    }
+
+    if (!ALLOWED_MD.includes(md)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid md. Allowed values: ${ALLOWED_MD.join(", ")}`,
+      });
+    }
+
+    if (!cgmRaw) {
+      return res.status(400).json({
+        success: false,
+        message: "cgm is required (chargeable weight in grams)",
+      });
+    }
+
+    // Integer grams only — reject decimals / non-numeric
+    if (!/^\d+$/.test(cgmRaw)) {
+      return res.status(400).json({
+        success: false,
+        message: "cgm must be a positive integer (grams)",
+      });
+    }
+
+    const cgm = Number(cgmRaw);
+    if (!Number.isInteger(cgm) || cgm <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "cgm must be a positive integer greater than 0",
+      });
+    }
+
+    if (cgm > MAX_CGM) {
+      return res.status(400).json({
+        success: false,
+        message: `cgm cannot exceed ${MAX_CGM} grams`,
+      });
+    }
+
+    if (!o_pin || !/^\d{6}$/.test(o_pin)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid o_pin. o_pin must be exactly 6 digits.",
+      });
+    }
+
+    if (!d_pin || !/^\d{6}$/.test(d_pin)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid d_pin. d_pin must be exactly 6 digits.",
+      });
+    }
+
+    if (!ss) {
+      return res.status(400).json({
+        success: false,
+        message: "ss is required",
+      });
+    }
+
+    if (!ALLOWED_SS.includes(ss)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid ss. Allowed values: ${ALLOWED_SS.join(", ")}`,
+      });
+    }
+
+    const data = await getShippingRate({
+      md,
+      cgm,
+      o_pin,
+      d_pin,
+      ss,
+    });
+
+    return res.status(200).json({
+      success: true,
+      md,
+      cgm,
+      o_pin,
+      d_pin,
+      ss,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery rate");
+  }
+}
+
+/**
+ * POST /api/delhivery/warehouse/create
+ * Also available under /api/delivery/warehouse/create
+ *
+ * Registers a Telaqua pickup / client warehouse with Delhivery.
+ * Admin/setup operation — does NOT touch the orders table.
+ */
+export async function createWarehouse(req, res) {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+
+    const payload = {};
+
+    for (const field of WAREHOUSE_FIELDS) {
+      const result = requireStringField(body, field);
+      if (!result.ok) {
+        return res.status(400).json({
+          success: false,
+          message: result.message,
+        });
+      }
+      payload[field] = result.value;
+    }
+
+    if (!/^\d{6}$/.test(payload.pin)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid pin. pin must be exactly 6 digits.",
+      });
+    }
+
+    if (!/^\d{6}$/.test(payload.return_pin)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid return_pin. return_pin must be exactly 6 digits.",
+      });
+    }
+
+    // Delhivery accepts numeric / masking phone; enforce non-empty digits (7–15)
+    const phoneDigits = payload.phone.replace(/\D/g, "");
+    if (phoneDigits.length < 7 || phoneDigits.length > 15) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid phone. Provide a valid contact number.",
+      });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid email format",
+      });
+    }
+
+    const data = await createClientWarehouse(payload);
+
+    // Delhivery sometimes returns HTTP 200 with an error/already-exists payload
+    const dataMessage = String(
+      data?.message || data?.msg || data?.error || ""
+    ).toLowerCase();
+    const indicatesFailure =
+      data?.success === false ||
+      data?.error === true ||
+      dataMessage.includes("already") ||
+      dataMessage.includes("exist") ||
+      dataMessage.includes("fail");
+
+    if (indicatesFailure) {
+      const message =
+        (typeof data?.message === "string" && data.message) ||
+        (typeof data?.msg === "string" && data.msg) ||
+        "Warehouse could not be created";
+
+      const status =
+        dataMessage.includes("already") || dataMessage.includes("exist")
+          ? 409
+          : 400;
+
+      return res.status(status).json({
+        success: false,
+        message,
+        data,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Warehouse created successfully",
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery warehouse create");
+  }
+}
+
+/**
+ * POST /api/delhivery/shipment/create
+ * Also available under /api/delivery/shipment/create
+ *
+ * Creates a Delhivery shipment for an existing Telaqua order.
+ * Reads order from DB — does NOT modify the orders table.
+ */
+export async function createShipmentForOrder(req, res) {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const hasOrderId =
+      body.order_id !== undefined &&
+      body.order_id !== null &&
+      String(body.order_id).trim() !== "";
+    const hasOrderNumber =
+      body.order_number !== undefined &&
+      body.order_number !== null &&
+      String(body.order_number).trim() !== "";
+
+    if (!hasOrderId && !hasOrderNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "order_id or order_number is required",
+      });
+    }
+
+    let order = null;
+
+    if (hasOrderId) {
+      const orderId = Number(body.order_id);
+      if (!Number.isInteger(orderId) || orderId <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "order_id must be a positive integer",
+        });
+      }
+
+      const { rows } = await query(`SELECT * FROM orders WHERE id = $1`, [
+        orderId,
+      ]);
+      order = rows[0] || null;
+    } else {
+      const orderNumber = String(body.order_number).trim();
+      const { rows } = await query(
+        `SELECT * FROM orders WHERE order_number = $1`,
+        [orderNumber]
+      );
+      order = rows[0] || null;
+    }
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // Required order fields for shipment
+    if (!order.customer_name || !String(order.customer_name).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Order is missing customer_name",
+      });
+    }
+    if (!order.phone || !String(order.phone).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Order is missing phone",
+      });
+    }
+    if (!order.address || !String(order.address).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Order is missing address",
+      });
+    }
+    if (!order.city || !String(order.city).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Order is missing city",
+      });
+    }
+    if (!order.state || !String(order.state).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Order is missing state",
+      });
+    }
+    if (!order.pincode || !/^\d{6}$/.test(String(order.pincode).trim())) {
+      return res.status(400).json({
+        success: false,
+        message: "Order pincode must be a valid 6-digit Indian pincode",
+      });
+    }
+    if (
+      order.quantity === undefined ||
+      order.quantity === null ||
+      Number(order.quantity) <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Order quantity must be greater than 0",
+      });
+    }
+    if (
+      order.total_amount === undefined ||
+      order.total_amount === null ||
+      Number(order.total_amount) <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Order total_amount must be greater than 0",
+      });
+    }
+    if (!order.payment_method || !String(order.payment_method).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Order is missing payment_method",
+      });
+    }
+    if (!order.order_number || !String(order.order_number).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Order is missing order_number",
+      });
+    }
+
+    if (String(order.order_status || "").trim() === "Cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot create shipment for a cancelled order",
+      });
+    }
+
+    const paymentMode = mapPaymentMode(order.payment_method);
+    if (!paymentMode) {
+      return res.status(400).json({
+        success: false,
+        message: `Unsupported payment_method for Delhivery: ${order.payment_method}`,
+      });
+    }
+
+    // Prepaid (Razorpay) shipments should be paid; COD can ship without Paid
+    if (
+      paymentMode === "Pre-paid" &&
+      String(order.payment_status || "").trim() !== "Paid"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Prepaid/Razorpay orders must have payment_status Paid before shipment creation",
+      });
+    }
+
+    const configResult = getShipmentConfig();
+    if (!configResult.ok) {
+      return res.status(500).json({
+        success: false,
+        message: configResult.message,
+      });
+    }
+
+    const payload = buildShipmentPayload(
+      order,
+      configResult.config,
+      paymentMode
+    );
+
+    // Limitation: orders table has no AWB/waybill column, so local duplicate
+    // detection is not possible. Delhivery enforces unique order IDs when
+    // auto-assigning waybills — surface those as 409 when returned.
+
+    const data = await createShipment(payload);
+    const interpreted = interpretShipmentCreateResult(data);
+
+    if (!interpreted.ok) {
+      return res.status(interpreted.status).json({
+        success: false,
+        message: interpreted.message,
+        order_id: order.id,
+        order_number: order.order_number,
+        data,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Shipment created successfully",
+      order_id: order.id,
+      order_number: order.order_number,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery shipment create");
+  }
+}
+
+/**
+ * Build and validate Delhivery Edit Order payload.
+ * @param {object} body
+ * @returns {{ ok: true, payload: object } | { ok: false, message: string }}
+ */
+function buildShipmentUpdatePayload(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, message: "Invalid JSON body" };
+  }
+
+  const waybill = String(body.waybill ?? "").trim();
+  if (!waybill) {
+    return { ok: false, message: "waybill is required" };
+  }
+
+  // Delhivery AWBs are numeric tracking IDs
+  if (!/^\d{8,20}$/.test(waybill)) {
+    return {
+      ok: false,
+      message: "waybill must be an 8–20 digit Delhivery AWB number",
+    };
+  }
+
+  const unknownKeys = Object.keys(body).filter(
+    (key) => key !== "waybill" && !SHIPMENT_UPDATE_OPTIONAL_FIELDS.includes(key)
+  );
+  if (unknownKeys.length > 0) {
+    return {
+      ok: false,
+      message: `Unsupported field(s): ${unknownKeys.join(", ")}. Allowed: waybill, ${SHIPMENT_UPDATE_OPTIONAL_FIELDS.join(", ")}`,
+    };
+  }
+
+  const payload = { waybill };
+  let updateCount = 0;
+
+  if (body.name !== undefined) {
+    const name = sanitizeDelhiveryText(body.name);
+    if (!name) {
+      return { ok: false, message: "name cannot be empty" };
+    }
+    payload.name = name;
+    updateCount += 1;
+  }
+
+  if (body.add !== undefined) {
+    const add = sanitizeDelhiveryText(body.add);
+    if (!add) {
+      return { ok: false, message: "add cannot be empty" };
+    }
+    payload.add = add;
+    updateCount += 1;
+  }
+
+  if (body.phone !== undefined) {
+    const phone = String(body.phone).trim();
+    const digits = phone.replace(/\D/g, "");
+    if (digits.length < 7 || digits.length > 15) {
+      return {
+        ok: false,
+        message: "phone must be a valid contact number",
+      };
+    }
+    payload.phone = phone;
+    updateCount += 1;
+  }
+
+  if (body.cod !== undefined) {
+    const cod = Number(body.cod);
+    if (!Number.isFinite(cod) || cod < 0) {
+      return { ok: false, message: "cod must be a number >= 0" };
+    }
+    payload.cod = cod;
+    updateCount += 1;
+  }
+
+  if (body.gm !== undefined) {
+    const gm = Number(body.gm);
+    if (!Number.isFinite(gm) || gm <= 0 || gm > MAX_CGM) {
+      return {
+        ok: false,
+        message: `gm must be a positive number up to ${MAX_CGM}`,
+      };
+    }
+    payload.gm = gm;
+    updateCount += 1;
+  }
+
+  for (const dim of ["shipment_length", "shipment_width", "shipment_height"]) {
+    if (body[dim] !== undefined) {
+      const value = Number(body[dim]);
+      if (!Number.isFinite(value) || value <= 0) {
+        return {
+          ok: false,
+          message: `${dim} must be a positive number`,
+        };
+      }
+      payload[dim] = value;
+      updateCount += 1;
+    }
+  }
+
+  if (body.product_details !== undefined) {
+    const product_details = sanitizeDelhiveryText(body.product_details);
+    if (!product_details) {
+      return { ok: false, message: "product_details cannot be empty" };
+    }
+    payload.product_details = product_details;
+    updateCount += 1;
+  }
+
+  if (body.pt !== undefined) {
+    const pt = String(body.pt).trim();
+    if (!ALLOWED_PAYMENT_MODES_PT.includes(pt)) {
+      return {
+        ok: false,
+        message: `Invalid pt. Allowed values: ${ALLOWED_PAYMENT_MODES_PT.join(", ")}`,
+      };
+    }
+    payload.pt = pt;
+    updateCount += 1;
+  }
+
+  if (updateCount === 0) {
+    return {
+      ok: false,
+      message: `At least one updatable field is required: ${SHIPMENT_UPDATE_OPTIONAL_FIELDS.join(", ")}`,
+    };
+  }
+
+  return { ok: true, payload };
+}
+
+/**
+ * POST /api/delhivery/shipment/update
+ * Also available under /api/delivery/shipment/update
+ *
+ * Updates an existing Delhivery shipment by waybill (Edit Order API).
+ * Does NOT modify the orders table.
+ */
+export async function updateShipmentDetails(req, res) {
+  try {
+    const built = buildShipmentUpdatePayload(req.body);
+    if (!built.ok) {
+      return res.status(400).json({
+        success: false,
+        message: built.message,
+      });
+    }
+
+    const data = await updateShipment(built.payload);
+
+    // Soft failures sometimes arrive as HTTP 200 with error flags
+    const dataMessage = String(
+      data?.message || data?.msg || data?.error || data?.rmk || ""
+    ).toLowerCase();
+    const indicatesFailure =
+      data?.success === false ||
+      data?.error === true ||
+      dataMessage.includes("fail") ||
+      dataMessage.includes("invalid") ||
+      dataMessage.includes("not found") ||
+      dataMessage.includes("cannot");
+
+    if (indicatesFailure) {
+      const message =
+        (typeof data?.message === "string" && data.message) ||
+        (typeof data?.msg === "string" && data.msg) ||
+        (typeof data?.rmk === "string" && data.rmk) ||
+        "Unable to update Delhivery shipment";
+
+      const status =
+        dataMessage.includes("not found") || dataMessage.includes("does not exist")
+          ? 404
+          : dataMessage.includes("already") || dataMessage.includes("conflict")
+            ? 409
+            : 400;
+
+      return res.status(status).json({
+        success: false,
+        message,
+        waybill: built.payload.waybill,
+        data,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Shipment updated successfully",
+      waybill: built.payload.waybill,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery shipment update");
+  }
+}
+
+/**
+ * POST /api/delhivery/tracking
+ * Also available under /api/delivery/tracking
+ *
+ * Tracks a Delhivery shipment by waybill (staging only).
+ * Does NOT read/write the orders table.
+ */
+export async function trackShipmentStatus(req, res) {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+
+    const unknownKeys = Object.keys(body).filter((key) => key !== "waybill");
+    if (unknownKeys.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Unsupported field(s): ${unknownKeys.join(", ")}. Allowed: waybill`,
+      });
+    }
+
+    if (body.waybill === undefined || body.waybill === null) {
+      return res.status(400).json({
+        success: false,
+        message: "Waybill is required",
+      });
+    }
+
+    const waybill = String(body.waybill).trim();
+    if (!waybill) {
+      return res.status(400).json({
+        success: false,
+        message: "Waybill is required",
+      });
+    }
+
+    if (!/^\d{8,20}$/.test(waybill)) {
+      return res.status(400).json({
+        success: false,
+        message: "waybill must be an 8–20 digit Delhivery AWB number",
+      });
+    }
+
+    const data = await trackShipment(waybill);
+
+    return res.status(200).json({
+      success: true,
+      message: "Shipment tracking fetched successfully",
+      waybill,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery tracking");
+  }
+}
+
+/**
+ * POST /api/delhivery/label
+ * Also available under /api/delivery/label
+ *
+ * Fetches packing-slip / shipping-label JSON for a waybill (staging only).
+ * Delhivery Packing Slip API expects query param `wbns`.
+ * Does NOT read/write the orders table.
+ */
+export async function generateLabel(req, res) {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+
+    const allowedKeys = ["waybill", "wbns"];
+    const unknownKeys = Object.keys(body).filter(
+      (key) => !allowedKeys.includes(key)
+    );
+    if (unknownKeys.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Unsupported field(s): ${unknownKeys.join(", ")}. Allowed: waybill, wbns`,
+      });
+    }
+
+    const raw =
+      body.waybill !== undefined && body.waybill !== null
+        ? body.waybill
+        : body.wbns;
+
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+      return res.status(400).json({
+        success: false,
+        message: "waybill is required (Delhivery packing slip uses wbns)",
+      });
+    }
+
+    const waybill = String(raw).trim();
+    if (!/^\d{8,20}$/.test(waybill)) {
+      return res.status(400).json({
+        success: false,
+        message: "waybill must be an 8–20 digit Delhivery AWB number",
+      });
+    }
+
+    const data = await generateShippingLabel(waybill);
+
+    return res.status(200).json({
+      success: true,
+      message: "Shipping label generated successfully",
+      waybill,
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery label");
+  }
+}
+
+/** Delhivery Pickup Request Creation — documented required fields only. */
+const PICKUP_REQUIRED_FIELDS = [
+  "pickup_time",
+  "pickup_date",
+  "pickup_location",
+  "expected_package_count",
+];
+
+/**
+ * Build/validate Delhivery pickup request payload.
+ * @param {object} body
+ * @returns {{ ok: true, payload: object } | { ok: false, message: string }}
+ */
+function buildPickupPayload(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, message: "Invalid JSON body" };
+  }
+
+  const unknownKeys = Object.keys(body).filter(
+    (key) => !PICKUP_REQUIRED_FIELDS.includes(key)
+  );
+  if (unknownKeys.length > 0) {
+    return {
+      ok: false,
+      message: `Unsupported field(s): ${unknownKeys.join(", ")}. Allowed: ${PICKUP_REQUIRED_FIELDS.join(", ")}`,
+    };
+  }
+
+  const pickup_time = String(body.pickup_time ?? "").trim();
+  const pickup_date = String(body.pickup_date ?? "").trim();
+  const pickup_location = String(body.pickup_location ?? "").trim();
+  const countRaw = body.expected_package_count;
+
+  if (!pickup_time) {
+    return { ok: false, message: "pickup_time is required (HH:MM:SS)" };
+  }
+  if (!/^\d{2}:\d{2}:\d{2}$/.test(pickup_time)) {
+    return {
+      ok: false,
+      message: "pickup_time must be in HH:MM:SS format",
+    };
+  }
+
+  if (!pickup_date) {
+    return { ok: false, message: "pickup_date is required (YYYY-MM-DD)" };
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(pickup_date)) {
+    return {
+      ok: false,
+      message: "pickup_date must be in YYYY-MM-DD format",
+    };
+  }
+
+  // Basic calendar validity check
+  const dateParts = pickup_date.split("-").map(Number);
+  const parsedDate = new Date(
+    Date.UTC(dateParts[0], dateParts[1] - 1, dateParts[2])
+  );
+  if (
+    Number.isNaN(parsedDate.getTime()) ||
+    parsedDate.getUTCFullYear() !== dateParts[0] ||
+    parsedDate.getUTCMonth() + 1 !== dateParts[1] ||
+    parsedDate.getUTCDate() !== dateParts[2]
+  ) {
+    return { ok: false, message: "pickup_date is not a valid calendar date" };
+  }
+
+  if (!pickup_location) {
+    return {
+      ok: false,
+      message:
+        "pickup_location is required (exact registered Delhivery warehouse name)",
+    };
+  }
+
+  if (countRaw === undefined || countRaw === null || String(countRaw).trim() === "") {
+    return { ok: false, message: "expected_package_count is required" };
+  }
+
+  const countStr = String(countRaw).trim();
+  if (!/^\d+$/.test(countStr)) {
+    return {
+      ok: false,
+      message: "expected_package_count must be a positive integer",
+    };
+  }
+
+  const expected_package_count = Number(countStr);
+  if (!Number.isInteger(expected_package_count) || expected_package_count <= 0) {
+    return {
+      ok: false,
+      message: "expected_package_count must be a positive integer greater than 0",
+    };
+  }
+
+  if (expected_package_count > 10000) {
+    return {
+      ok: false,
+      message: "expected_package_count is unreasonably large",
+    };
+  }
+
+  return {
+    ok: true,
+    payload: {
+      pickup_time,
+      pickup_date,
+      pickup_location,
+      expected_package_count,
+    },
+  };
+}
+
+/**
+ * POST /api/delhivery/pickup
+ * Also available under /api/delivery/pickup
+ *
+ * Creates a Delhivery pickup request (staging only).
+ * Does NOT read/write the orders table.
+ */
+export async function createPickupRequest(req, res) {
+  try {
+    const built = buildPickupPayload(req.body);
+    if (!built.ok) {
+      return res.status(400).json({
+        success: false,
+        message: built.message,
+      });
+    }
+
+    const data = await requestPickup(built.payload);
+
+    return res.status(200).json({
+      success: true,
+      message: "Pickup request submitted successfully",
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery pickup");
+  }
+}
+
+/** Documented NDR actions for Asynchronous NDR Package Action API. */
+const NDR_ACTIONS = ["RE-ATTEMPT", "DEFER_DLV", "EDIT_DETAILS"];
+const NDR_EDIT_DETAIL_FIELDS = ["name", "phone", "add"];
+
+/**
+ * Validate one NDR data item from Delhivery's `data` array.
+ * @param {object} item
+ * @param {number} index
+ * @returns {{ ok: true, value: object } | { ok: false, message: string }}
+ */
+function validateNdrItem(item, index) {
+  const label = `data[${index}]`;
+
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return { ok: false, message: `${label} must be an object` };
+  }
+
+  const unknownKeys = Object.keys(item).filter(
+    (key) => !["waybill", "act", "action_data"].includes(key)
+  );
+  if (unknownKeys.length > 0) {
+    return {
+      ok: false,
+      message: `${label} unsupported field(s): ${unknownKeys.join(", ")}. Allowed: waybill, act, action_data`,
+    };
+  }
+
+  const waybill = String(item.waybill ?? "").trim();
+  if (!waybill) {
+    return { ok: false, message: `${label}.waybill is required` };
+  }
+  if (!/^\d{8,20}$/.test(waybill)) {
+    return {
+      ok: false,
+      message: `${label}.waybill must be an 8–20 digit Delhivery AWB number`,
+    };
+  }
+
+  const act = String(item.act ?? "").trim();
+  if (!act) {
+    return { ok: false, message: `${label}.act is required` };
+  }
+  if (!NDR_ACTIONS.includes(act)) {
+    return {
+      ok: false,
+      message: `${label}.act must be one of: ${NDR_ACTIONS.join(", ")}`,
+    };
+  }
+
+  const value = { waybill, act };
+
+  if (act === "RE-ATTEMPT") {
+    if (item.action_data !== undefined && item.action_data !== null) {
+      const actionData = item.action_data;
+      if (
+        typeof actionData !== "object" ||
+        Array.isArray(actionData) ||
+        Object.keys(actionData).length > 0
+      ) {
+        return {
+          ok: false,
+          message: `${label}.action_data must be omitted or empty for RE-ATTEMPT`,
+        };
+      }
+    }
+    return { ok: true, value };
+  }
+
+  if (act === "DEFER_DLV") {
+    const actionData = item.action_data;
+    if (!actionData || typeof actionData !== "object" || Array.isArray(actionData)) {
+      return {
+        ok: false,
+        message: `${label}.action_data is required for DEFER_DLV`,
+      };
+    }
+
+    const unknownActionKeys = Object.keys(actionData).filter(
+      (key) => key !== "deferred_date"
+    );
+    if (unknownActionKeys.length > 0) {
+      return {
+        ok: false,
+        message: `${label}.action_data unsupported field(s): ${unknownActionKeys.join(", ")}. Allowed: deferred_date`,
+      };
+    }
+
+    const deferred_date = String(actionData.deferred_date ?? "").trim();
+    if (!deferred_date) {
+      return {
+        ok: false,
+        message: `${label}.action_data.deferred_date is required (YYYY-MM-DD)`,
+      };
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(deferred_date)) {
+      return {
+        ok: false,
+        message: `${label}.action_data.deferred_date must be in YYYY-MM-DD format`,
+      };
+    }
+
+    value.action_data = { deferred_date };
+    return { ok: true, value };
+  }
+
+  // EDIT_DETAILS — at least one of name, phone, add
+  const actionData = item.action_data;
+  if (!actionData || typeof actionData !== "object" || Array.isArray(actionData)) {
+    return {
+      ok: false,
+      message: `${label}.action_data is required for EDIT_DETAILS`,
+    };
+  }
+
+  const unknownActionKeys = Object.keys(actionData).filter(
+    (key) => !NDR_EDIT_DETAIL_FIELDS.includes(key)
+  );
+  if (unknownActionKeys.length > 0) {
+    return {
+      ok: false,
+      message: `${label}.action_data unsupported field(s): ${unknownActionKeys.join(", ")}. Allowed: ${NDR_EDIT_DETAIL_FIELDS.join(", ")}`,
+    };
+  }
+
+  const cleaned = {};
+  for (const field of NDR_EDIT_DETAIL_FIELDS) {
+    if (actionData[field] !== undefined && actionData[field] !== null) {
+      const text = sanitizeDelhiveryText(actionData[field]);
+      if (!text) {
+        return {
+          ok: false,
+          message: `${label}.action_data.${field} cannot be empty`,
+        };
+      }
+      if (field === "phone") {
+        const digits = text.replace(/\D/g, "");
+        if (digits.length < 7 || digits.length > 15) {
+          return {
+            ok: false,
+            message: `${label}.action_data.phone must be a valid contact number`,
+          };
+        }
+      }
+      cleaned[field] = field === "phone" ? String(actionData[field]).trim() : text;
+    }
+  }
+
+  if (Object.keys(cleaned).length === 0) {
+    return {
+      ok: false,
+      message: `${label}.action_data must include at least one of: ${NDR_EDIT_DETAIL_FIELDS.join(", ")}`,
+    };
+  }
+
+  value.action_data = cleaned;
+  return { ok: true, value };
+}
+
+/**
+ * Build Delhivery NDR payload: { data: [...] }
+ * @param {object} body
+ * @returns {{ ok: true, payload: object } | { ok: false, message: string }}
+ */
+function buildNdrPayload(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, message: "Invalid JSON body" };
+  }
+
+  const unknownKeys = Object.keys(body).filter((key) => key !== "data");
+  if (unknownKeys.length > 0) {
+    return {
+      ok: false,
+      message: `Unsupported field(s): ${unknownKeys.join(", ")}. Allowed: data`,
+    };
+  }
+
+  if (!Array.isArray(body.data) || body.data.length === 0) {
+    return {
+      ok: false,
+      message: "data is required and must be a non-empty array of NDR actions",
+    };
+  }
+
+  if (body.data.length > 50) {
+    return {
+      ok: false,
+      message: "data cannot contain more than 50 NDR actions per request",
+    };
+  }
+
+  const data = [];
+  for (let i = 0; i < body.data.length; i += 1) {
+    const result = validateNdrItem(body.data[i], i);
+    if (!result.ok) {
+      return result;
+    }
+    data.push(result.value);
+  }
+
+  return { ok: true, payload: { data } };
+}
+
+/**
+ * POST /api/delhivery/ndr
+ * Also available under /api/delivery/ndr
+ *
+ * Submits Delhivery NDR package action(s) (staging only).
+ * Does NOT read/write the orders table.
+ */
+export async function updateNdrAction(req, res) {
+  try {
+    const built = buildNdrPayload(req.body);
+    if (!built.ok) {
+      return res.status(400).json({
+        success: false,
+        message: built.message,
+      });
+    }
+
+    const data = await updateNdr(built.payload);
+
+    return res.status(200).json({
+      success: true,
+      message: "NDR update submitted successfully",
+      data,
+    });
+  } catch (error) {
+    return handleDelhiveryError(res, error, "Delivery NDR update");
+  }
+}

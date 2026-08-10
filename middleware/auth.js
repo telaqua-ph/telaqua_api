@@ -2,64 +2,43 @@
  * middleware/auth.js
  *
  * JWT verification middleware for protected admin routes.
- *
  * Expects: Authorization: Bearer <token>
- * Verifies with process.env.JWT_SECRET
  */
 
 import { verifyToken } from "../lib/auth.js";
 
 /**
- * Require a valid Bearer JWT on the request.
- * On success: attaches payload to req.user and returns true.
- * On failure: sends HTTP 401 JSON and returns false.
- *
- * @param {import('http').IncomingMessage} req
- * @param {import('http').ServerResponse} res
- * @returns {boolean}
+ * Express middleware — require a valid Bearer JWT.
+ * On success: attaches payload to req.user and calls next().
+ * On failure: sends HTTP 401 JSON.
  */
-export function requireAuth(req, res) {
+export function requireAuth(req, res, next) {
   const header = req.headers.authorization || req.headers.Authorization;
 
   if (!header || typeof header !== "string" || !header.startsWith("Bearer ")) {
-    res.statusCode = 401;
-    res.setHeader("Content-Type", "application/json");
-    res.end(
-      JSON.stringify({
-        success: false,
-        message: "Unauthorized",
-      })
-    );
-    return false;
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
   }
 
   const token = header.slice("Bearer ".length).trim();
 
   if (!token) {
-    res.statusCode = 401;
-    res.setHeader("Content-Type", "application/json");
-    res.end(
-      JSON.stringify({
-        success: false,
-        message: "Unauthorized",
-      })
-    );
-    return false;
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
   }
 
   try {
     const payload = verifyToken(token);
     req.user = payload;
-    return true;
+    return next();
   } catch {
-    res.statusCode = 401;
-    res.setHeader("Content-Type", "application/json");
-    res.end(
-      JSON.stringify({
-        success: false,
-        message: "Unauthorized",
-      })
-    );
-    return false;
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
   }
 }

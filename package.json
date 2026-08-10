@@ -1,33 +1,33 @@
 {
   "name": "telaqua-api",
-  "version": "1.0.0",
-  "description": "Production-ready REST API for Tel-Aqua — serves the customer website and admin dashboard",
+  "version": "2.0.0",
+  "description": "Production-ready REST API for Tel-Aqua — Node.js + Express",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod",
+    "dev": "node --watch server.js",
+    "start": "node server.js",
     "lint": "echo \"No linter configured yet\""
   },
   "dependencies": {
-    "@vercel/postgres": "^0.10.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
-    "razorpay": "^2.9.8",
-    "zod": "^3.25.76"
-  },
-  "devDependencies": {
-    "vercel": "^39.0.0"
+    "morgan": "^1.11.0",
+    "pg": "^8.22.0",
+    "razorpay": "^2.9.8"
   },
   "keywords": [
     "telaqua",
     "api",
-    "vercel",
-    "serverless"
+    "express",
+    "nodejs"
   ],
   "license": "UNLICENSED"
 }
