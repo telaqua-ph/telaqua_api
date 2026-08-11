@@ -661,6 +661,7 @@ export async function createTestPaymentOrder(req, res) {
 
     let inserted;
     try {
+      // Do not insert into `notes` — that column does not exist on production orders.
       const result = await query(
         `INSERT INTO orders (
           customer_name,
@@ -680,12 +681,11 @@ export async function createTestPaymentOrder(req, res) {
           promo_code,
           original_amount,
           discount_amount,
-          notes,
           is_test_order
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
           'Razorpay', 'Pending', 'New', $11, NULL, $12, 0,
-          $13, TRUE
+          TRUE
         )
         RETURNING id`,
         [
@@ -701,15 +701,32 @@ export async function createTestPaymentOrder(req, res) {
           total_amount,
           razorpayOrder.id,
           total_amount,
-          `TEST ORDER | ${TEST_PRODUCT_NAME}`,
         ]
       );
       inserted = result.rows;
     } catch (dbErr) {
-      console.error("TEST ORDER: database insert failure:", dbErr?.message);
+      console.error("TEST ORDER: database insert failure:", {
+        code: dbErr?.code,
+        message: dbErr?.message,
+        detail: dbErr?.detail,
+        hint: dbErr?.hint,
+        column: dbErr?.column,
+        constraint: dbErr?.constraint,
+        table: dbErr?.table,
+        stack: dbErr?.stack,
+      });
+      // Temporary: expose real DB error while debugging create-test-order
       return res.status(500).json({
         success: false,
         message: "Failed to save test order",
+        db_error: {
+          code: dbErr?.code || null,
+          message: dbErr?.message || String(dbErr),
+          detail: dbErr?.detail || null,
+          hint: dbErr?.hint || null,
+          column: dbErr?.column || null,
+          constraint: dbErr?.constraint || null,
+        },
       });
     }
 
@@ -969,8 +986,7 @@ export async function verifyPayment(req, res) {
       }
       await query(
         `UPDATE orders
-         SET notes = COALESCE(notes, '') || ' | signature_invalid',
-             updated_at = CURRENT_TIMESTAMP
+         SET updated_at = CURRENT_TIMESTAMP
          WHERE id = $1
            AND payment_status = 'Pending'`,
         [orderRow.id]
@@ -997,8 +1013,7 @@ export async function verifyPayment(req, res) {
         );
         await query(
           `UPDATE orders
-           SET notes = COALESCE(notes, '') || ' | amount_mismatch',
-               updated_at = CURRENT_TIMESTAMP
+           SET updated_at = CURRENT_TIMESTAMP
            WHERE id = $1
              AND payment_status = 'Pending'`,
           [orderRow.id]
