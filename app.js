@@ -12,6 +12,7 @@ import morgan from "morgan";
 import authRoutes from "./routes/auth.js";
 import ordersRoutes from "./routes/orders.js";
 import paymentRoutes from "./routes/payment.js";
+import testRazorpayRoutes from "./routes/testRazorpay.js";
 import contactRoutes from "./routes/contact.js";
 import customersRoutes from "./routes/customers.js";
 import dashboardRoutes from "./routes/dashboard.js";
@@ -98,6 +99,8 @@ app.get("/health", (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/orders", ordersRoutes);
 app.use("/api/payment", paymentRoutes);
+/** Isolated ₹1 LIVE test aliases — same handlers as create-test-order / verify-payment */
+app.use("/api/test/razorpay", testRazorpayRoutes);
 app.use("/api/promo", promoRoutes);
 app.use("/api/contact", contactRoutes);
 app.use("/api/customers", customersRoutes);
