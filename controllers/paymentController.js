@@ -15,6 +15,10 @@ import {
   mapPromoPricing,
   incrementPromoUsedCount,
 } from "../services/promoService.js";
+import {
+  ensureWhatsappConsentColumns,
+  parseWhatsappConsent,
+} from "../services/whatsappConsent.js";
 
 /** Default PH meter unit price when no promo is applied. */
 const PRODUCT_PRICE = 2499;
@@ -115,6 +119,11 @@ function validateCreatePaymentOrder(body) {
     return { error: "quantity must be an integer greater than 0" };
   }
 
+  const consent = parseWhatsappConsent(body);
+  if (consent.error) {
+    return { error: consent.error };
+  }
+
   return {
     data: {
       customer_name,
@@ -126,6 +135,8 @@ function validateCreatePaymentOrder(body) {
       pincode: String(pincode),
       quantity,
       promo_code,
+      whatsapp_updates_consent: consent.whatsapp_updates_consent,
+      whatsapp_consent_at: consent.whatsapp_consent_at,
     },
   };
 }
@@ -456,6 +467,17 @@ export async function createPaymentOrder(req, res) {
       });
     }
 
+    try {
+      await ensureWhatsappConsentColumns();
+    } catch (colErr) {
+      console.error("WhatsApp consent columns ensure failed:", colErr?.message);
+      return res.status(500).json({
+        success: false,
+        message:
+          "Orders table is missing WhatsApp consent columns. Run sql/add_whatsapp_consent.sql",
+      });
+    }
+
     const amountInPaise = Math.round(pricing.total_amount * 100);
     const receipt = generateReceipt("taq");
 
@@ -494,10 +516,12 @@ export async function createPaymentOrder(req, res) {
         razorpay_order_id,
         promo_code,
         original_amount,
-        discount_amount
+        discount_amount,
+        whatsapp_updates_consent,
+        whatsapp_consent_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        'Razorpay', 'Pending', 'New', $11, $12, $13, $14
+        'Razorpay', 'Pending', 'New', $11, $12, $13, $14, $15, $16
       )
       RETURNING id`,
       [
@@ -515,6 +539,8 @@ export async function createPaymentOrder(req, res) {
         pricing.promo_code,
         pricing.original_amount,
         pricing.discount_amount,
+        orderData.whatsapp_updates_consent,
+        orderData.whatsapp_consent_at,
       ]
     );
 

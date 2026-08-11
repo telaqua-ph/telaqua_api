@@ -18,6 +18,7 @@ import customersRoutes from "./routes/customers.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import deliveryRoutes from "./routes/delivery.js";
 import promoRoutes from "./routes/promo.js";
+import promoCodesRoutes from "./routes/promoCodes.js";
 
 const app = express();
 
@@ -102,6 +103,7 @@ app.use("/api/payment", paymentRoutes);
 /** Isolated ₹1 LIVE test aliases — same handlers as create-test-order / verify-payment */
 app.use("/api/test/razorpay", testRazorpayRoutes);
 app.use("/api/promo", promoRoutes);
+app.use("/api/promo-codes", promoCodesRoutes);
 app.use("/api/contact", contactRoutes);
 app.use("/api/customers", customersRoutes);
 app.use("/api/dashboard", dashboardRoutes);

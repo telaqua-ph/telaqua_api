@@ -6,6 +6,10 @@
  */
 
 import { query } from "../config/db.js";
+import {
+  ensureWhatsappConsentColumns,
+  parseWhatsappConsent,
+} from "../services/whatsappConsent.js";
 
 const ALLOWED_ORDER_STATUSES = [
   "New",
@@ -78,6 +82,11 @@ function validateCreateOrder(body) {
     return { error: "payment_method is required" };
   }
 
+  const consent = parseWhatsappConsent(body);
+  if (consent.error) {
+    return { error: consent.error };
+  }
+
   let email = null;
   if (emailRaw !== undefined && emailRaw !== null && emailRaw !== "") {
     if (!isValidEmail(emailRaw)) {
@@ -99,6 +108,8 @@ function validateCreateOrder(body) {
       unit_price,
       total_amount,
       payment_method,
+      whatsapp_updates_consent: consent.whatsapp_updates_consent,
+      whatsapp_consent_at: consent.whatsapp_consent_at,
     },
   };
 }
@@ -155,6 +166,17 @@ export async function createOrder(req, res) {
 
     const orderData = validation.data;
 
+    try {
+      await ensureWhatsappConsentColumns();
+    } catch (colErr) {
+      console.error("WhatsApp consent columns ensure failed:", colErr?.message);
+      return res.status(500).json({
+        success: false,
+        message:
+          "Orders table is missing WhatsApp consent columns. Run sql/add_whatsapp_consent.sql",
+      });
+    }
+
     const { rows: duplicates } = await query(
       `SELECT id
        FROM orders
@@ -187,9 +209,11 @@ export async function createOrder(req, res) {
         total_amount,
         payment_method,
         payment_status,
-        order_status
+        order_status,
+        whatsapp_updates_consent,
+        whatsapp_consent_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'Pending', 'New'
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'Pending', 'New', $12, $13
       )
       RETURNING id`,
       [
@@ -204,6 +228,8 @@ export async function createOrder(req, res) {
         orderData.unit_price,
         orderData.total_amount,
         orderData.payment_method,
+        orderData.whatsapp_updates_consent,
+        orderData.whatsapp_consent_at,
       ]
     );
 

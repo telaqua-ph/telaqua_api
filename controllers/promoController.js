@@ -9,7 +9,8 @@ import {
   normalizePromoCode,
   mapPromoPricing,
   findOfferByPlatformLanguage,
-  findActivePromoByCode,
+  findPromoByCode,
+  isPromoWithinUsageLimit,
 } from "../services/promoService.js";
 
 const ALLOWED_PLATFORMS = [
@@ -110,11 +111,28 @@ export async function validatePromoCode(req, res) {
       });
     }
 
-    const row = await findActivePromoByCode(code);
+    const row = await findPromoByCode(code);
     if (!row) {
       return res.status(400).json({
         success: false,
+        valid: false,
         message: "Invalid or inactive promo code",
+      });
+    }
+
+    if (!row.is_active) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: "This coupon is no longer active",
+      });
+    }
+
+    if (!isPromoWithinUsageLimit(row)) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: "This coupon has reached its usage limit",
       });
     }
 
@@ -122,6 +140,7 @@ export async function validatePromoCode(req, res) {
 
     return res.status(200).json({
       success: true,
+      valid: true,
       promo: {
         code: promo.code,
         original_price: promo.original_price,
