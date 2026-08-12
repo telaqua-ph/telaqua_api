@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildSwipePayload } from "../services/invoiceService.js";
+import { createSwipeInvoiceForOrder } from "../services/swipeService.js";
 
 function order(overrides = {}) {
   return {
@@ -93,4 +94,44 @@ test("Rs 1 test invoice keeps enough precision for Swipe tax validation", () => 
   assert.equal(payload.payments[0].amount, 1);
   assert.equal(payload.items[0].unit, undefined);
   assert.equal(payload.party.billing_address, undefined);
+});
+
+test("Swipe mapping and missing-bank responses are corrected before one invoice succeeds", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.SWIPE_API_KEY;
+  const requests = [];
+  const replies = [
+    { status: 400, body: { success: false, message: "customer is already mapped with id TAQ-ORDER-129" } },
+    { status: 400, body: { success: false, message: "These product names are already mapped: Test Product → TAQ-PRODUCT-ORDER-129" } },
+    { status: 400, body: { success: false, message: "Bank details not found" } },
+    { status: 200, body: { success: true, data: { hash_id: "hash-1", serial_number: "BM-29" } } },
+  ];
+  process.env.SWIPE_API_KEY = "test-only-key";
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    const reply = replies.shift();
+    return new Response(JSON.stringify(reply.body), {
+      status: reply.status,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    const testOrder = order({ id: 133, is_test_order: true, total_amount: 1,
+      final_total: 1, subtotal: 1, taxable_amount: 0.85, gst_amount: 0.15 });
+    const result = await createSwipeInvoiceForOrder(
+      testOrder,
+      buildSwipePayload(testOrder)
+    );
+    assert.equal(result.data.hash_id, "hash-1");
+    assert.equal(requests.length, 4);
+    assert.equal(requests[1].party.id, "TAQ-ORDER-129");
+    assert.equal(requests[2].items[0].id, "TAQ-PRODUCT-ORDER-129");
+    assert.equal(requests[3].payments, undefined);
+    assert.match(requests[3].notes, /Paid via Razorpay/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.SWIPE_API_KEY;
+    else process.env.SWIPE_API_KEY = originalKey;
+  }
 });

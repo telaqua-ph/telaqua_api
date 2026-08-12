@@ -93,40 +93,67 @@ export async function createSwipeInvoiceForOrder(order, payload) {
     apiKeyLoaded: config.apiKeyLoaded,
   });
 
-  let response = await requestSwipe("/doc", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-
-  let responseText = await response.text();
-  let data = parseJsonMaybe(responseText);
-
-  // Some Swipe accounts reject invoice creation with "Bank details not found"
-  // when the optional payments array is supplied before a bank account is set up.
-  // The rejected request creates no document. Retry once without only that optional
-  // object so the paid website order still receives its invoice; reconciliation is
-  // retained in reference/notes and the invoice total is unchanged.
-  const bankDetailsMissing =
-    !response.ok &&
-    response.status === 400 &&
-    /bank details not found/i.test(String(data?.message || data?.error || "")) &&
-    Array.isArray(payload.payments);
-  if (bankDetailsMissing) {
-    console.warn("[Invoice] Swipe has no bank details; retrying document without payment record", {
-      orderId: order.id,
-    });
-    const fallbackPayload = { ...payload };
-    delete fallbackPayload.payments;
-    fallbackPayload.notes = [
-      payload.notes,
-      `Paid via Razorpay: ${order.razorpay_payment_id}`,
-    ].filter(Boolean).join("; ");
+  // Swipe owns mappings between customer/product details and IDs. If this account
+  // already mapped the same details under an older ID, a rejected request tells us
+  // which ID to reuse. A rejected 400 creates no document, so these corrections are
+  // safe to retry before any hash_id exists.
+  const workingPayload = JSON.parse(JSON.stringify(payload));
+  let response;
+  let data;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
     response = await requestSwipe("/doc", {
       method: "POST",
-      body: JSON.stringify(fallbackPayload),
+      body: JSON.stringify(workingPayload),
     });
-    responseText = await response.text();
-    data = parseJsonMaybe(responseText);
+    data = parseJsonMaybe(await response.text());
+    if (response.ok && data?.success !== false) break;
+
+    const safeBody = JSON.stringify({
+      message: data?.message || data?.error || "",
+      errors: data?.errors || null,
+    });
+    let corrected = false;
+
+    const mappedParty = safeBody.match(
+      /customer is already mapped with id\s+([^:\s"']+)/i
+    )?.[1];
+    if (mappedParty && workingPayload.party?.id !== mappedParty) {
+      workingPayload.party.id = mappedParty;
+      corrected = true;
+      console.warn("[Invoice] Reusing Swipe customer mapping", {
+        orderId: order.id,
+        partyId: mappedParty,
+      });
+    }
+
+    const mappedProduct = safeBody.match(
+      /product names are already mapped:[\s\S]*?(?:→|->|â†’|\\u2192)\s*([A-Za-z0-9_-]+)/i
+    )?.[1];
+    if (mappedProduct && workingPayload.items?.[0]?.id !== mappedProduct) {
+      workingPayload.items[0].id = mappedProduct;
+      corrected = true;
+      console.warn("[Invoice] Reusing Swipe product mapping", {
+        orderId: order.id,
+        productId: mappedProduct,
+      });
+    }
+
+    if (
+      /bank details not found/i.test(safeBody) &&
+      Array.isArray(workingPayload.payments)
+    ) {
+      delete workingPayload.payments;
+      workingPayload.notes = [
+        workingPayload.notes,
+        `Paid via Razorpay: ${order.razorpay_payment_id}`,
+      ].filter(Boolean).join("; ");
+      corrected = true;
+      console.warn("[Invoice] Swipe has no bank details; omitting payment record", {
+        orderId: order.id,
+      });
+    }
+
+    if (!corrected) break;
   }
 
   console.log("[Invoice] Swipe response received", {
