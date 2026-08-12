@@ -11,7 +11,8 @@
   "scripts": {
     "dev": "node --watch server.js",
     "start": "node server.js",
-    "lint": "echo \"No linter configured yet\""
+    "lint": "echo \"No linter configured yet\"",
+    "test": "node --test --test-isolation=none"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -4,13 +4,13 @@
  * Swipe Document V2 integration for invoice creation and retrieval.
  */
 
-const SWIPE_BASE_URL = "https://app.getswipe.in/api/partner/v2";
+const DEFAULT_SWIPE_BASE_URL = "https://app.getswipe.in/api/partner/v2";
 const REQUEST_TIMEOUT_MS = 30000;
 
 function getToken() {
-  const token = (process.env.SWIPE_API_TOKEN || "").trim();
+  const token = (process.env.SWIPE_API_KEY || "").trim();
   if (!token) {
-    throw new Error("SWIPE_API_TOKEN is not configured");
+    throw new Error("SWIPE_API_KEY is not configured");
   }
   return token;
 }
@@ -23,11 +23,14 @@ function maskId(id) {
 
 async function requestSwipe(path, options = {}) {
   const token = getToken();
+  const baseUrl = (process.env.SWIPE_BASE_URL || DEFAULT_SWIPE_BASE_URL)
+    .trim()
+    .replace(/\/$/, "");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    const response = await fetch(`${SWIPE_BASE_URL}${path}`, {
+    const response = await fetch(`${baseUrl}${path}`, {
       ...options,
       headers: {
         Authorization: `Bearer ${token}`,

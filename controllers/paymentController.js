@@ -327,6 +327,47 @@ function maskId(id) {
   return `${s.slice(0, 4)}…${s.slice(-4)}`;
 }
 
+function round2(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+function buildFinancialSnapshot(pricing) {
+  // Existing storefront prices are GST-inclusive. Discount is applied by choosing
+  // the server-side promo price, then GST is extracted from that discounted value.
+  const gstRate = 18;
+  const shippingAmount = 0;
+  const finalTotal = round2(pricing.total_amount + shippingAmount);
+  const taxableAmount = round2(pricing.total_amount / (1 + gstRate / 100));
+  const gstAmount = round2(pricing.total_amount - taxableAmount);
+  return {
+    subtotal: round2(pricing.original_amount),
+    taxableAmount,
+    gstAmount,
+    gstRate,
+    shippingAmount,
+    finalTotal,
+  };
+}
+
+function createInvoiceAccessToken() {
+  const token = crypto.randomBytes(32).toString("hex");
+  const hash = crypto.createHash("sha256").update(token).digest("hex");
+  return { token, hash };
+}
+
+function hashInvoiceAccessToken(token) {
+  return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+}
+
+function isValidInvoiceAccessToken(order, token) {
+  const expected = String(order?.invoice_access_token_hash || "");
+  const actual = hashInvoiceAccessToken(token);
+  const left = Buffer.from(expected, "utf8");
+  const right = Buffer.from(actual, "utf8");
+  return left.length === right.length && left.length > 0 &&
+    crypto.timingSafeEqual(left, right);
+}
+
 function buildVerifySuccessResponse(order, message) {
   const isTest = Boolean(order.is_test_order);
   return {
@@ -370,19 +411,19 @@ function validateInvoiceStatusPayload(body) {
   }
 
   const order_id = parsePositiveOrderId(body.order_id);
-  const razorpay_payment_id = trimStr(body.razorpay_payment_id);
+  const invoice_access_token = trimStr(body.invoice_access_token);
 
   if (!order_id) {
     return { error: "order_id must be a positive integer" };
   }
-  if (!razorpay_payment_id) {
-    return { error: "razorpay_payment_id is required" };
+  if (!invoice_access_token) {
+    return { error: "invoice_access_token is required" };
   }
 
   return {
     data: {
       order_id,
-      razorpay_payment_id: String(razorpay_payment_id),
+      invoice_access_token: String(invoice_access_token),
     },
   };
 }
@@ -398,7 +439,7 @@ export async function getInvoiceStatus(req, res) {
       });
     }
 
-    const { order_id, razorpay_payment_id } = validation.data;
+    const { order_id, invoice_access_token } = validation.data;
     const order = await loadOrderForFulfillment(order_id);
 
     if (!order) {
@@ -408,10 +449,10 @@ export async function getInvoiceStatus(req, res) {
       });
     }
 
-    if (String(order.razorpay_payment_id || "") !== razorpay_payment_id) {
+    if (!isValidInvoiceAccessToken(order, invoice_access_token)) {
       return res.status(403).json({
         success: false,
-        message: "Payment does not match this order",
+        message: "You are not allowed to access this order",
       });
     }
 
@@ -431,7 +472,9 @@ export async function getInvoiceStatus(req, res) {
         success: true,
         invoice_ready: true,
         invoice_number: order.invoice_number,
-        invoice_url: order.invoice_url,
+        invoice_url:
+          `/api/payment/invoice-download?order_id=${encodeURIComponent(order.id)}` +
+          `&invoice_access_token=${encodeURIComponent(invoice_access_token)}`,
         invoice_generated_at: order.invoice_generated_at,
       });
     }
@@ -452,11 +495,13 @@ export async function getInvoiceStatus(req, res) {
   }
 }
 
-/** GET /api/payment/invoice-download?order_id=&razorpay_payment_id= */
+/** GET /api/payment/invoice-download?order_id=&invoice_access_token= */
 export async function downloadCustomerInvoice(req, res) {
   try {
     const order_id = parsePositiveOrderId(req.query.order_id);
-    const razorpay_payment_id = trimStr(req.query.razorpay_payment_id);
+    const invoice_access_token = trimStr(
+      req.headers["x-order-token"] || req.query.invoice_access_token
+    );
 
     if (!order_id) {
       return res.status(400).json({
@@ -464,10 +509,10 @@ export async function downloadCustomerInvoice(req, res) {
         message: "order_id must be a positive integer",
       });
     }
-    if (!razorpay_payment_id) {
+    if (!invoice_access_token) {
       return res.status(400).json({
         success: false,
-        message: "razorpay_payment_id is required",
+        message: "invoice_access_token is required",
       });
     }
 
@@ -478,10 +523,10 @@ export async function downloadCustomerInvoice(req, res) {
         message: "Order not found",
       });
     }
-    if (String(order.razorpay_payment_id || "") !== razorpay_payment_id) {
+    if (!isValidInvoiceAccessToken(order, invoice_access_token)) {
       return res.status(403).json({
         success: false,
-        message: "Payment does not match this order",
+        message: "You are not allowed to access this order",
       });
     }
     if (String(order.payment_status || "").trim() !== "Paid") {
@@ -501,11 +546,12 @@ export async function downloadCustomerInvoice(req, res) {
     const pdf = await getOrderInvoicePdfByOrderId(order.id);
     const invoiceNumber =
       order.invoice_number || `invoice-order-${String(order.id)}`;
+    const safeInvoiceNumber = String(invoiceNumber).replace(/[^a-zA-Z0-9._-]/g, "-");
 
     res.setHeader("Content-Type", pdf.contentType || "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${invoiceNumber}.pdf"`
+      `attachment; filename="${safeInvoiceNumber}.pdf"`
     );
     return res.status(200).send(pdf.buffer);
   } catch (error) {
@@ -651,7 +697,14 @@ async function assertRazorpayAmountMatches(order, razorpay_order_id, razorpay_pa
     return { error: "Payment does not belong to this Razorpay order" };
   }
 
-  return { ok: true, expectedPaise };
+  if (String(rzPayment.status || "").toLowerCase() !== "captured") {
+    return { error: "Payment has not been captured yet" };
+  }
+  if (String(rzPayment.currency || "INR").toUpperCase() !== "INR") {
+    return { error: "Payment currency does not match the order" };
+  }
+
+  return { ok: true, expectedPaise, payment: rzPayment };
 }
 
 /** POST /api/payment/create-order — PH meter (unchanged pricing) */
@@ -702,26 +755,8 @@ export async function createPaymentOrder(req, res) {
       });
     }
 
-    const amountInPaise = Math.round(pricing.total_amount * 100);
-    const receipt = generateReceipt("taq");
-
-    const razorpay = getRazorpayClient();
-    const razorpayOrder = await razorpay.orders.create({
-      amount: amountInPaise,
-      currency: "INR",
-      receipt,
-      notes: {
-        customer_name: orderData.customer_name,
-        phone: orderData.phone,
-        email: orderData.email,
-        quantity: String(orderData.quantity),
-        promo_code: pricing.promo_code || "",
-        unit_price: String(pricing.unit_price),
-        original_amount: String(pricing.original_amount),
-        discount_amount: String(pricing.discount_amount),
-      },
-    });
-
+    const financial = buildFinancialSnapshot(pricing);
+    const invoiceAccess = createInvoiceAccessToken();
     const { rows: inserted } = await query(
       `INSERT INTO orders (
         customer_name,
@@ -737,15 +772,23 @@ export async function createPaymentOrder(req, res) {
         payment_method,
         payment_status,
         order_status,
-        razorpay_order_id,
         promo_code,
         original_amount,
         discount_amount,
+        subtotal,
+        taxable_amount,
+        gst_amount,
+        gst_rate,
+        shipping_amount,
+        final_total,
+        invoice_status,
+        invoice_access_token_hash,
         whatsapp_updates_consent,
         whatsapp_consent_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        'Razorpay', 'Pending', 'New', $11, $12, $13, $14, $15, $16
+        'Razorpay', 'Pending', 'New', $11, $12, $13, $14, $15,
+        $16, $17, $18, $19, 'not_created', $20, $21, $22
       )
       RETURNING id`,
       [
@@ -759,10 +802,16 @@ export async function createPaymentOrder(req, res) {
         orderData.quantity,
         pricing.unit_price,
         pricing.total_amount,
-        razorpayOrder.id,
         pricing.promo_code,
         pricing.original_amount,
         pricing.discount_amount,
+        financial.subtotal,
+        financial.taxableAmount,
+        financial.gstAmount,
+        financial.gstRate,
+        financial.shippingAmount,
+        financial.finalTotal,
+        invoiceAccess.hash,
         orderData.whatsapp_updates_consent,
         orderData.whatsapp_consent_at,
       ]
@@ -772,23 +821,49 @@ export async function createPaymentOrder(req, res) {
     const orderNumber = `TAQ-${String(dbOrderId).padStart(6, "0")}`;
 
     await query(
-      `UPDATE orders
-       SET order_number = $1,
-           updated_at = CURRENT_TIMESTAMP
+      `UPDATE orders SET order_number = $1, updated_at = CURRENT_TIMESTAMP
        WHERE id = $2`,
       [orderNumber, dbOrderId]
+    );
+
+    const amountInPaise = Math.round(financial.finalTotal * 100);
+    const receipt = generateReceipt("taq");
+    const razorpay = getRazorpayClient();
+    const razorpayOrder = await razorpay.orders.create({
+      amount: amountInPaise,
+      currency: "INR",
+      receipt,
+      notes: {
+        website_order_id: orderNumber,
+        website_order_db_id: String(dbOrderId),
+        quantity: String(orderData.quantity),
+        promo_code: pricing.promo_code || "",
+        final_total: String(financial.finalTotal),
+      },
+    });
+
+    await query(
+      `UPDATE orders SET razorpay_order_id = $1,
+         updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      [razorpayOrder.id, dbOrderId]
     );
 
     return res.status(201).json({
       success: true,
       order_id: razorpayOrder.id,
+      db_order_id: dbOrderId,
+      order_number: orderNumber,
       amount: razorpayOrder.amount,
       currency: razorpayOrder.currency,
       key_id: process.env.RAZORPAY_KEY_ID,
       promo_code: pricing.promo_code,
       original_amount: pricing.original_amount,
       discount_amount: pricing.discount_amount,
-      total_amount: pricing.total_amount,
+      total_amount: financial.finalTotal,
+      taxable_amount: financial.taxableAmount,
+      gst_amount: financial.gstAmount,
+      shipping_amount: financial.shippingAmount,
+      invoice_access_token: invoiceAccess.token,
     });
   } catch (error) {
     console.error("Payment create-order error:", error);
@@ -806,14 +881,9 @@ export async function createPaymentOrder(req, res) {
       });
     }
 
-    const razorpayMessage =
-      error?.error?.description ||
-      error?.description ||
-      error?.message;
-
     return res.status(500).json({
       success: false,
-      message: razorpayMessage || "Internal server error",
+      message: "We could not start the payment. Please try again.",
     });
   }
 }
@@ -862,6 +932,11 @@ export async function createTestPaymentOrder(req, res) {
     const total_amount = TEST_AMOUNT_RUPEES;
     const amountInPaise = TEST_AMOUNT_PAISE;
     const receipt = generateReceipt("test");
+    const testFinancial = buildFinancialSnapshot({
+      original_amount: total_amount,
+      total_amount,
+    });
+    const invoiceAccess = createInvoiceAccessToken();
 
     const razorpay = getRazorpayClient();
     let razorpayOrder;
@@ -884,10 +959,7 @@ export async function createTestPaymentOrder(req, res) {
       );
       return res.status(502).json({
         success: false,
-        message:
-          rzErr?.error?.description ||
-          rzErr?.message ||
-          "Razorpay order creation failed",
+        message: "Razorpay order creation failed",
       });
     }
 
@@ -931,11 +1003,19 @@ export async function createTestPaymentOrder(req, res) {
           promo_code,
           original_amount,
           discount_amount,
+          subtotal,
+          taxable_amount,
+          gst_amount,
+          gst_rate,
+          shipping_amount,
+          final_total,
+          invoice_status,
+          invoice_access_token_hash,
           is_test_order
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
           'Razorpay', 'Pending', 'New', $11, NULL, $12, 0,
-          TRUE
+          $13, $14, $15, $16, $17, $18, 'not_created', $19, TRUE
         )
         RETURNING id`,
         [
@@ -951,6 +1031,13 @@ export async function createTestPaymentOrder(req, res) {
           total_amount,
           razorpayOrder.id,
           total_amount,
+          testFinancial.subtotal,
+          testFinancial.taxableAmount,
+          testFinancial.gstAmount,
+          testFinancial.gstRate,
+          testFinancial.shippingAmount,
+          testFinancial.finalTotal,
+          invoiceAccess.hash,
         ]
       );
       inserted = result.rows;
@@ -965,18 +1052,9 @@ export async function createTestPaymentOrder(req, res) {
         table: dbErr?.table,
         stack: dbErr?.stack,
       });
-      // Temporary: expose real DB error while debugging create-test-order
       return res.status(500).json({
         success: false,
         message: "Failed to save test order",
-        db_error: {
-          code: dbErr?.code || null,
-          message: dbErr?.message || String(dbErr),
-          detail: dbErr?.detail || null,
-          hint: dbErr?.hint || null,
-          column: dbErr?.column || null,
-          constraint: dbErr?.constraint || null,
-        },
       });
     }
 
@@ -1011,6 +1089,7 @@ export async function createTestPaymentOrder(req, res) {
       key_id: process.env.RAZORPAY_KEY_ID,
       product: TEST_PRODUCT_NAME,
       total_amount: TEST_AMOUNT_RUPEES,
+      invoice_access_token: invoiceAccess.token,
       is_test_order: true,
     });
   } catch (error) {
@@ -1112,6 +1191,28 @@ export async function verifyPayment(req, res) {
     orderRow = existingOrder.rows[0];
     const isTest = Boolean(orderRow.is_test_order);
 
+    // Verify every callback, including retries for an already-paid order.
+    let valid;
+    try {
+      valid = isValidRazorpaySignature(
+        orderRow.razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature
+      );
+    } catch (sigErr) {
+      console.error("Payment signature config error:", sigErr?.message);
+      return res.status(500).json({
+        success: false,
+        message: "Payment verification is not configured",
+      });
+    }
+    if (!valid) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment signature.",
+      });
+    }
+
     if (isTest) {
       console.log(
         "TEST ORDER: payment verification started",
@@ -1207,93 +1308,35 @@ export async function verifyPayment(req, res) {
       );
     }
 
-    if (orderRow.payment_status !== "Pending") {
+    if (!["Pending", "Failed"].includes(orderRow.payment_status)) {
       return res.status(400).json({
         success: false,
         message: "Order is not eligible for payment verification",
       });
     }
 
-    let valid;
-    try {
-      valid = isValidRazorpaySignature(
-        razorpay_order_id,
-        razorpay_payment_id,
-        razorpay_signature
-      );
-    } catch (sigErr) {
-      console.error("Payment signature config error:", sigErr?.message);
-      return res.status(500).json({
-        success: false,
-        message: "Payment verification is not configured",
-      });
-    }
-
-    if (!valid) {
-      if (isTest) {
-        console.warn(
-          "TEST ORDER: payment verification failed (invalid signature)",
-          maskId(razorpay_order_id)
-        );
-      }
-      await query(
-        `UPDATE orders
-         SET updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1
-           AND payment_status = 'Pending'`,
-        [orderRow.id]
-      ).catch(() => {});
-      return res.status(400).json({
-        success: false,
-        message: "Invalid payment signature.",
-      });
-    }
-
     // Amount cross-check against Razorpay API only for the ₹1 LIVE test path
     // (keeps normal PH meter verify behavior signature-based as before).
-    if (isTest) {
-      const amountCheck = await assertRazorpayAmountMatches(
-        orderRow,
-        razorpay_order_id,
-        razorpay_payment_id
-      );
-
-      if (amountCheck.error) {
-        console.warn(
-          "TEST ORDER: payment verification failed (amount)",
-          amountCheck.error
-        );
-        await query(
-          `UPDATE orders
-           SET updated_at = CURRENT_TIMESTAMP
-           WHERE id = $1
-             AND payment_status = 'Pending'`,
-          [orderRow.id]
-        ).catch(() => {});
-        return res.status(400).json({
-          success: false,
-          message: amountCheck.error,
-        });
-      }
-    }
-
-    // Persist actual Razorpay instrument into orders.payment_method (not "Razorpay")
-    let resolvedPaymentMethod = null;
-    try {
-      resolvedPaymentMethod = await fetchRazorpayPaymentMethod(
-        razorpay_payment_id
-      );
-    } catch (methodErr) {
-      console.error(
-        "Razorpay payment method fetch failed:",
-        maskId(razorpay_payment_id),
-        methodErr?.error?.description || methodErr?.message
-      );
-      return res.status(400).json({
+    const amountCheck = await assertRazorpayAmountMatches(
+      orderRow,
+      razorpay_order_id,
+      razorpay_payment_id
+    );
+    if (amountCheck.error) {
+      console.warn("Razorpay payment verification failed", {
+        orderId: orderRow.id,
+        message: amountCheck.error,
+      });
+      return res.status(409).json({
         success: false,
-        message: "Failed to fetch Razorpay payment method",
+        message: "We could not verify this payment yet. Please check your order status.",
       });
     }
+
+    // Persist the instrument from the same captured payment fetched above.
+    const resolvedPaymentMethod = normalizeRazorpayPaymentMethod(
+      amountCheck.payment?.method
+    );
 
     if (!resolvedPaymentMethod) {
       console.warn(
@@ -1320,7 +1363,7 @@ export async function verifyPayment(req, res) {
            payment_date = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
          WHERE razorpay_order_id = $3
-           AND payment_status = 'Pending'
+           AND payment_status IN ('Pending', 'Failed')
          RETURNING
            id,
            order_number,
@@ -1356,7 +1399,7 @@ export async function verifyPayment(req, res) {
              payment_date = CURRENT_TIMESTAMP,
              updated_at = CURRENT_TIMESTAMP
            WHERE razorpay_order_id = $3
-             AND payment_status = 'Pending'
+             AND payment_status IN ('Pending', 'Failed')
            RETURNING
              id,
              order_number,

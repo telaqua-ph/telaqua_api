@@ -1,10 +1,9 @@
 /**
- * services/invoiceService.js
- *
- * Idempotent Swipe invoice creation after paid orders.
- * Replaces the older Interakt + custom PDF generation flow.
+ * Idempotent Swipe invoice creation after a Razorpay payment is captured.
+ * All money values come from the order snapshot; current product prices are never read.
  */
 
+import crypto from "node:crypto";
 import { query } from "../config/db.js";
 import { normalizeIndianPhone } from "../utils/phoneUtils.js";
 import {
@@ -15,456 +14,283 @@ import {
 
 const ORDER_SELECT = `
   SELECT
-    id,
-    customer_name,
-    phone,
-    email,
-    address,
-    city,
-    state,
-    pincode,
-    quantity,
-    unit_price,
-    total_amount,
-    payment_method,
-    payment_status,
-    order_status,
-    order_number,
-    razorpay_order_id,
-    razorpay_payment_id,
-    payment_date,
-    promo_code,
-    original_amount,
-    discount_amount,
+    id, customer_name, phone, email, address, city, state, pincode,
+    quantity, unit_price, total_amount, payment_method, payment_status,
+    order_status, order_number, razorpay_order_id, razorpay_payment_id,
+    payment_date, promo_code, original_amount, discount_amount,
     COALESCE(is_test_order, FALSE) AS is_test_order,
-    invoice_number,
-    invoice_url,
-    invoice_generated_at,
-    invoice_status,
-    whatsapp_invoice_status,
-    whatsapp_invoice_message_id,
-    whatsapp_invoice_sent_at,
-    whatsapp_invoice_error,
-    whatsapp_updates_consent,
-    whatsapp_consent_at,
-    swipe_invoice_id
-  FROM orders
-  WHERE id = $1
-  LIMIT 1
+    subtotal, taxable_amount, gst_amount, gst_rate, shipping_amount,
+    final_total, invoice_number, invoice_url, invoice_generated_at,
+    invoice_status, invoice_processing_started_at, invoice_attempt_token,
+    swipe_invoice_id, swipe_invoice_error, whatsapp_invoice_status,
+    whatsapp_invoice_message_id, whatsapp_invoice_sent_at,
+    whatsapp_invoice_error, whatsapp_updates_consent, whatsapp_consent_at
+  FROM orders WHERE id = $1 LIMIT 1
 `;
 
-/**
- * @param {number} orderId
- * @returns {Promise<object|null>}
- */
 export async function loadOrderForFulfillment(orderId) {
   const { rows } = await query(ORDER_SELECT, [orderId]);
   return rows[0] || null;
 }
 
-/**
- * @param {number|string} value
- */
 function round2(value) {
-  const n = Number(value);
-  return Math.round((n + Number.EPSILON) * 100) / 100;
+  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
-function formatDateDdMmYyyy(value = new Date()) {
+function formatDate(value = new Date()) {
   const date = value instanceof Date ? value : new Date(value);
-  const dd = String(date.getDate()).padStart(2, "0");
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  const yyyy = date.getFullYear();
-  return `${dd}-${mm}-${yyyy}`;
+  return [
+    String(date.getDate()).padStart(2, "0"),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    date.getFullYear(),
+  ].join("-");
 }
 
-function normalizeState(state) {
-  return String(state || "").trim().toUpperCase() || "";
-}
-
-function buildStablePartyId(order) {
-  const phone = String(order.phone || "").replace(/\D/g, "");
-  if (phone) return `TAQ-CUST-PHONE-${phone}`;
-
-  const email = String(order.email || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (email) return `TAQ-CUST-EMAIL-${email}`;
-
-  return `TAQ-ORDER-${order.id}`;
-}
-
-function buildAddressPayload(order) {
-  const addrId = `order-${order.id}-addr`;
+function buildAddress(order) {
   return {
     addr_id: 1,
-    addr_id_v2: addrId,
+    addr_id_v2: `order-${order.id}-address`,
     address_line1: String(order.address || "").slice(0, 200),
     address_line2: "",
     city: String(order.city || ""),
-    state: normalizeState(order.state),
+    state: String(order.state || "").trim().toUpperCase(),
     country: "India",
     pincode: String(order.pincode || ""),
   };
 }
 
-function buildPartyPayload(order) {
+function buildParty(order) {
   const phone = normalizeIndianPhone(order.phone);
+  // An order-specific party preserves the billing snapshot if a customer later
+  // changes their profile. Swipe updates old documents linked to reused party IDs.
   const party = {
-    id: buildStablePartyId(order),
+    id: `TAQ-ORDER-${order.id}`,
     type: "customer",
     name: String(order.customer_name || `Order ${order.id}`),
     email: order.email || undefined,
-    billing_address: buildAddressPayload(order),
-    shipping_address: buildAddressPayload(order),
+    billing_address: buildAddress(order),
+    shipping_address: buildAddress(order),
   };
-
   if (!phone.error) {
     party.country_code = "91";
     party.phone_number = phone.phoneNumber;
   }
-
   return party;
 }
 
-function buildSwipeItem(order) {
-  const qty = Math.max(1, Number(order.quantity) || 1);
-  const totalInclusive = round2(order.total_amount);
-  const totalExclusive = round2(totalInclusive / 1.18);
-  const unitInclusive = round2(totalInclusive / qty);
-  const unitExclusive = round2(totalExclusive / qty);
+function getFinancialSnapshot(order) {
+  const finalTotal = round2(order.final_total ?? order.total_amount);
+  const shipping = round2(order.shipping_amount || 0);
+  const rate = round2(order.gst_rate ?? 18);
+  const taxable = round2(
+    order.taxable_amount ?? (finalTotal - shipping) / (1 + rate / 100)
+  );
+  const gst = round2(order.gst_amount ?? finalTotal - shipping - taxable);
+  const productTotal = round2(taxable + gst);
 
-  return {
-    id: String(process.env.SWIPE_PRODUCT_ID || "9027"),
-    name: process.env.TELAQUA_PRODUCT_NAME || "Tel-Aqua PH Meter",
-    quantity: qty,
-    unit_price: unitExclusive,
-    tax_rate: 18,
-    price_with_tax: unitInclusive,
-    net_amount: totalExclusive,
-    total_amount: totalInclusive,
-    item_type: "Product",
-    unit: "UNT",
-    hsn_code: "9027",
-  };
+  if (
+    !Number.isFinite(finalTotal) ||
+    finalTotal <= 0 ||
+    round2(productTotal + shipping) !== finalTotal
+  ) {
+    const error = new Error("Order financial snapshot is inconsistent");
+    error.statusCode = 400;
+    throw error;
+  }
+  return { finalTotal, shipping, rate, taxable, gst, productTotal };
 }
 
-function buildSwipePayload(order) {
-  const item = buildSwipeItem(order);
-  const consented = Boolean(order.whatsapp_updates_consent);
-  const phone = normalizeIndianPhone(order.phone);
-  const sendWtsp = consented && !phone.error && !order.is_test_order;
-
-  // orders.payment_method stores Razorpay instrument (upi/card/…).
-  // Swipe only accepts: cash, card, upi, netBanking, cheque, emi.
-  const rawMethod = String(order.payment_method || "")
-    .trim()
-    .toLowerCase();
-  const swipeMethodMap = {
-    upi: "upi",
-    card: "card",
-    netbanking: "netBanking",
-    emi: "emi",
-    cash: "cash",
-    cheque: "cheque",
-    wallet: "upi",
-    paylater: "emi",
+function mapPaymentMethod(value) {
+  const method = String(value || "").trim().toLowerCase();
+  return {
+    upi: "upi", card: "card", netbanking: "netBanking", emi: "emi",
+    cash: "cash", cheque: "cheque", wallet: "upi", paylater: "emi",
     razorpay: "upi",
+  }[method] || "upi";
+}
+
+export function buildSwipePayload(order) {
+  const money = getFinancialSnapshot(order);
+  const quantity = Math.max(1, Number(order.quantity) || 1);
+  const productItem = {
+    id: `TAQ-PRODUCT-ORDER-${order.id}`,
+    name: order.is_test_order
+      ? "Tel-Aqua Razorpay Test Product"
+      : process.env.TELAQUA_PRODUCT_NAME || "Tel-Aqua PH Meter",
+    quantity,
+    unit_price: round2(money.taxable / quantity),
+    tax_rate: money.rate,
+    price_with_tax: round2(money.productTotal / quantity),
+    net_amount: money.taxable,
+    total_amount: money.productTotal,
+    item_type: "Product",
+    unit: "UNT",
+    hsn_code: String(process.env.SWIPE_PRODUCT_HSN || "9027"),
   };
-  const swipePaymentMethod = swipeMethodMap[rawMethod] || "upi";
+  const items = [productItem];
+  if (money.shipping > 0) {
+    items.push({
+      id: `TAQ-SHIPPING-ORDER-${order.id}`,
+      name: "Shipping",
+      quantity: 1,
+      unit_price: money.shipping,
+      tax_rate: 0,
+      price_with_tax: money.shipping,
+      net_amount: money.shipping,
+      total_amount: money.shipping,
+      item_type: "Service",
+      unit: "UNT",
+    });
+  }
 
   return {
     document_type: "invoice",
-    document_date: formatDateDdMmYyyy(new Date()),
-    party: buildPartyPayload(order),
-    items: [item],
-    payments: [
-      {
-        amount: round2(order.total_amount),
-        method: swipePaymentMethod,
-        notes: order.razorpay_payment_id || order.razorpay_order_id || "",
-      },
-    ],
-    reference:
-      order.order_number || `TAQ-${String(order.id).padStart(6, "0")}`,
+    document_date: formatDate(order.payment_date || new Date()),
+    party: buildParty(order),
+    items,
+    payments: [{
+      amount: money.finalTotal,
+      method: mapPaymentMethod(order.payment_method),
+      notes: String(order.razorpay_payment_id || ""),
+    }],
+    reference: `Website Order: ${order.order_number || order.id}; Razorpay Payment: ${order.razorpay_payment_id}`,
     notes: order.promo_code
-      ? `Promo code applied: ${order.promo_code}`
+      ? `Coupon ${order.promo_code}; discount Rs ${round2(order.discount_amount || 0)}`
       : undefined,
-    send_wtsp: sendWtsp,
+    // Swipe uses the order snapshot contact data for dashboard-configured email/
+    // WhatsApp automation. send_wtsp is enabled only with explicit site consent.
+    send_wtsp: Boolean(order.whatsapp_updates_consent && !order.is_test_order),
     send_sms: false,
   };
 }
 
-function buildStoredInvoiceUrl(order) {
-  const paymentId = String(order.razorpay_payment_id || "").trim();
-  if (!paymentId) return null;
-
-  const relativePath =
-    `/api/payment/invoice-download?order_id=${encodeURIComponent(order.id)}` +
-    `&razorpay_payment_id=${encodeURIComponent(paymentId)}`;
-
-  const base = (process.env.BACKEND_BASE_URL || "").trim().replace(/\/$/, "");
-  if (!base) {
-    return relativePath;
-  }
-  return `${base}${relativePath}`;
-}
-
-function buildWhatsAppStatusForCreatedInvoice(order) {
-  if (order.is_test_order) {
-    return {
-      status: "not_applicable",
-      messageId: null,
-      sentAt: null,
-      error: "Test order — WhatsApp not applicable",
-    };
-  }
-
-  if (!order.whatsapp_updates_consent) {
-    return {
-      status: "not_applicable",
-      messageId: null,
-      sentAt: null,
-      error: null,
-    };
-  }
-
-  const phone = normalizeIndianPhone(order.phone);
-  if (phone.error) {
-    return {
-      status: "failed",
-      messageId: null,
-      sentAt: null,
-      error: phone.error,
-    };
-  }
-
-  // Swipe supports send_wtsp on document creation, but current public docs
-  // do not expose a separate message-status API. Keep status conservative.
+function existingInvoice(order) {
   return {
-    status: "pending",
-    messageId: null,
-    sentAt: null,
-    error: null,
+    invoice_number: order.invoice_number || null,
+    invoice_url: order.invoice_url || null,
+    invoice_generated_at: order.invoice_generated_at || null,
+    swipe_invoice_id: order.swipe_invoice_id || null,
+    created: false,
+    pending: false,
   };
 }
 
-/**
- * Ensure Swipe invoice exists and DB fields are set. Idempotent.
- * @param {object} order
- * @returns {Promise<{ invoice_number: string|null, invoice_url: string|null, invoice_generated_at: Date|null, swipe_invoice_id: string|null, created: boolean }>}
- */
-async function ensureInvoiceGenerated(order) {
-  if (
-    order.swipe_invoice_id ||
-    (order.invoice_number && String(order.invoice_status || "") === "generated")
-  ) {
-    console.log("Invoice reuse:", order.invoice_number || order.swipe_invoice_id);
-    return {
-      invoice_number: order.invoice_number || null,
-      invoice_url: order.invoice_url,
-      invoice_generated_at: order.invoice_generated_at,
-      swipe_invoice_id: order.swipe_invoice_id || null,
-      created: false,
-    };
-  }
-
-  console.log("Swipe invoice generation started for order", order.id);
-  const payload = buildSwipePayload(order);
-  let created;
-
-  try {
-    created = await createSwipeInvoiceForOrder(order, payload);
-  } catch (err) {
-    console.error("Swipe invoice creation failure:", {
-      orderId: order.id,
-      message: err?.message,
-      statusCode: err?.statusCode,
-    });
-    await query(
-      `UPDATE orders
-       SET invoice_status = 'failed',
-           whatsapp_invoice_status = CASE
-             WHEN whatsapp_invoice_status = 'sent' THEN whatsapp_invoice_status
-             ELSE 'failed'
-           END,
-           whatsapp_invoice_error = $2,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [order.id, String(err?.message || "Swipe invoice creation failed").slice(0, 500)]
-    ).catch(() => {});
-    throw new Error("Swipe invoice creation failed");
-  }
-
-  let hashId = created?.data?.hash_id ? String(created.data.hash_id) : null;
-  let serialNumber = created?.data?.serial_number
-    ? String(created.data.serial_number)
-    : null;
-
-  if (!hashId) {
-    throw new Error("Swipe response missing hash_id");
-  }
-
-  if (!serialNumber) {
-    try {
-      const details = await getSwipeInvoiceDetails(hashId);
-      serialNumber =
-        details?.data?.invoice_details?.serial_number ||
-        details?.data?.serial_number ||
-        null;
-    } catch (err) {
-      console.warn("Swipe invoice details fetch failed:", {
-        orderId: order.id,
-        hashId,
-        message: err?.message,
-      });
-    }
-  }
-
-  const publicUrl = buildStoredInvoiceUrl(order);
-  const wtsp = buildWhatsAppStatusForCreatedInvoice(order);
-
+async function claimInvoiceCreation(orderId) {
+  const token = crypto.randomUUID();
   const { rows } = await query(
     `UPDATE orders
-     SET
-       invoice_number = $1,
-       invoice_url = $2,
-       invoice_generated_at = CURRENT_TIMESTAMP,
-       invoice_status = 'generated',
-       swipe_invoice_id = $3,
-       whatsapp_invoice_status = CASE
-         WHEN whatsapp_invoice_status = 'sent' THEN whatsapp_invoice_status
-         ELSE $4
-       END,
-       whatsapp_invoice_message_id = CASE
-         WHEN whatsapp_invoice_status = 'sent' THEN whatsapp_invoice_message_id
-         ELSE $5
-       END,
-       whatsapp_invoice_sent_at = CASE
-         WHEN whatsapp_invoice_status = 'sent' THEN whatsapp_invoice_sent_at
-         ELSE $6
-       END,
-       whatsapp_invoice_error = CASE
-         WHEN whatsapp_invoice_status = 'sent' THEN whatsapp_invoice_error
-         ELSE $7
-       END,
-       updated_at = CURRENT_TIMESTAMP
-     WHERE id = $8
-       AND swipe_invoice_id IS NULL
-       AND (invoice_status IS NULL OR invoice_status <> 'generated')
-     RETURNING invoice_number, invoice_url, invoice_generated_at, swipe_invoice_id`,
-    [
-      serialNumber,
-      publicUrl,
-      hashId,
-      wtsp.status,
-      wtsp.messageId,
-      wtsp.sentAt,
-      wtsp.error,
-      order.id,
-    ]
+     SET invoice_status = 'pending', invoice_attempt_token = $2,
+         invoice_processing_started_at = CURRENT_TIMESTAMP,
+         swipe_invoice_error = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1 AND payment_status = 'Paid' AND swipe_invoice_id IS NULL
+       AND (
+         invoice_status IS NULL OR invoice_status IN ('not_created', 'failed')
+         OR (invoice_status = 'pending' AND
+             invoice_processing_started_at < NOW() - INTERVAL '5 minutes')
+       )
+     RETURNING id`,
+    [orderId, token]
   );
-
-  if (rows.length > 0) {
-    return {
-      invoice_number: rows[0].invoice_number,
-      invoice_url: rows[0].invoice_url,
-      invoice_generated_at: rows[0].invoice_generated_at,
-      swipe_invoice_id: rows[0].swipe_invoice_id,
-      created: true,
-    };
-  }
-
-  // Race: another request saved first
-  const refreshed = await loadOrderForFulfillment(order.id);
-  if (
-    refreshed?.swipe_invoice_id ||
-    (refreshed?.invoice_number &&
-      String(refreshed?.invoice_status || "") === "generated")
-  ) {
-    return {
-      invoice_number: refreshed.invoice_number || null,
-      invoice_url: refreshed.invoice_url || null,
-      invoice_generated_at: refreshed.invoice_generated_at || null,
-      swipe_invoice_id: refreshed.swipe_invoice_id || null,
-      created: false,
-    };
-  }
-
-  throw new Error("Failed to save invoice to database");
+  return rows.length ? token : null;
 }
 
-/**
- * @param {number} orderId
- */
+export async function ensureSwipeInvoiceForPaidOrder(orderId) {
+  let order = await loadOrderForFulfillment(orderId);
+  if (!order) {
+    const error = new Error("Order not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (String(order.payment_status).trim() !== "Paid") {
+    const error = new Error("Order payment is not completed");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (order.swipe_invoice_id) return existingInvoice(order);
+
+  const attemptToken = await claimInvoiceCreation(order.id);
+  if (!attemptToken) {
+    order = await loadOrderForFulfillment(order.id);
+    if (order?.swipe_invoice_id) return existingInvoice(order);
+    return { ...existingInvoice(order), pending: true };
+  }
+
+  console.log(`Swipe invoice creation started for ${order.order_number || order.id}`);
+  try {
+    const result = await createSwipeInvoiceForOrder(order, buildSwipePayload(order));
+    const hashId = String(result?.data?.hash_id || "");
+    let serialNumber = result?.data?.serial_number
+      ? String(result.data.serial_number)
+      : null;
+    if (!hashId) throw new Error("Swipe response missing hash_id");
+    if (!serialNumber) {
+      try {
+        const details = await getSwipeInvoiceDetails(hashId);
+        serialNumber = details?.data?.invoice_details?.serial_number ||
+          details?.data?.serial_number || null;
+      } catch (error) {
+        console.warn("Swipe invoice number lookup failed", { orderId: order.id, message: error?.message });
+      }
+    }
+
+    const { rows } = await query(
+      `UPDATE orders SET invoice_number = $1, invoice_url = $2,
+         invoice_generated_at = CURRENT_TIMESTAMP, invoice_status = 'generated',
+         swipe_invoice_id = $3, swipe_invoice_error = NULL,
+         invoice_attempt_token = NULL, invoice_processing_started_at = NULL,
+         whatsapp_invoice_status = CASE
+           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, FALSE)
+             THEN 'pending' ELSE 'not_applicable' END,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4 AND invoice_attempt_token = $5 AND swipe_invoice_id IS NULL
+       RETURNING invoice_number, invoice_url, invoice_generated_at, swipe_invoice_id`,
+      [serialNumber, `/api/orders/${order.id}/invoice/download`, hashId, order.id, attemptToken]
+    );
+    if (!rows.length) throw new Error("Invoice claim was lost before it could be saved");
+    console.log(`Swipe invoice ${serialNumber || hashId} created for ${order.order_number || order.id}`);
+    return { ...rows[0], created: true, pending: false };
+  } catch (error) {
+    const safeError = String(error?.message || "Swipe invoice creation failed").slice(0, 500);
+    await query(
+      `UPDATE orders SET invoice_status = 'failed', swipe_invoice_error = $3,
+         invoice_attempt_token = NULL, invoice_processing_started_at = NULL,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND invoice_attempt_token = $2`,
+      [order.id, attemptToken, safeError]
+    ).catch(() => {});
+    console.error(`Swipe invoice creation failed for ${order.order_number || order.id}`, { message: safeError });
+    const wrapped = new Error("Swipe invoice creation failed");
+    wrapped.statusCode = 502;
+    throw wrapped;
+  }
+}
+
 export async function getOrderInvoicePdfByOrderId(orderId) {
   const order = await loadOrderForFulfillment(orderId);
   if (!order) {
-    const err = new Error("Order not found");
-    err.statusCode = 404;
-    throw err;
+    const error = new Error("Order not found");
+    error.statusCode = 404;
+    throw error;
   }
-  if (!order.swipe_invoice_id) {
-    const err = new Error("Invoice is not generated yet");
-    err.statusCode = 404;
-    throw err;
+  if (String(order.payment_status).trim() !== "Paid" || !order.swipe_invoice_id) {
+    const error = new Error("Invoice is not available for this order yet");
+    error.statusCode = 404;
+    throw error;
   }
   return getSwipeInvoicePdf(order.swipe_invoice_id);
 }
 
-/**
- * Process invoice + WhatsApp for a paid order. Safe to call multiple times.
- * @param {number} orderId
- * @returns {Promise<object>}
- */
 export async function processOrderFulfillment(orderId) {
+  const invoice = await ensureSwipeInvoiceForPaidOrder(orderId);
   const order = await loadOrderForFulfillment(orderId);
-  if (!order) {
-    const err = new Error("Order not found");
-    err.statusCode = 404;
-    throw err;
-  }
-
-  if (String(order.payment_status).trim() !== "Paid") {
-    const err = new Error("Order payment is not completed");
-    err.statusCode = 400;
-    throw err;
-  }
-
-  const invoice = await ensureInvoiceGenerated(order);
-  const refreshed = await loadOrderForFulfillment(orderId);
-  const whatsapp = {
-    status: refreshed?.whatsapp_invoice_status || order.whatsapp_invoice_status || null,
-    message_id:
-      refreshed?.whatsapp_invoice_message_id ||
-      order.whatsapp_invoice_message_id ||
-      null,
-    sent_at:
-      refreshed?.whatsapp_invoice_sent_at ||
-      order.whatsapp_invoice_sent_at ||
-      null,
-    error:
-      refreshed?.whatsapp_invoice_error ||
-      order.whatsapp_invoice_error ||
-      null,
-  };
-
   return {
     success: true,
-    invoice: {
-      invoice_number: invoice.invoice_number,
-      invoice_url: invoice.invoice_url,
-      invoice_generated_at: invoice.invoice_generated_at,
-      swipe_invoice_id: invoice.swipe_invoice_id,
-      created: invoice.created,
-    },
+    invoice,
     whatsapp: {
-      status: whatsapp.status,
-      message_id: whatsapp.message_id,
-      sent_at: whatsapp.sent_at,
-      error: whatsapp.error || null,
+      status: order?.whatsapp_invoice_status || null,
+      message_id: order?.whatsapp_invoice_message_id || null,
+      sent_at: order?.whatsapp_invoice_sent_at || null,
+      error: order?.whatsapp_invoice_error || null,
     },
   };
 }

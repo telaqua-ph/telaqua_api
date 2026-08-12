@@ -22,6 +22,7 @@ import deliveryRoutes from "./routes/delivery.js";
 import promoRoutes from "./routes/promo.js";
 import promoCodesRoutes from "./routes/promoCodes.js";
 import { handleSwipeWebhook } from "./controllers/swipeWebhookController.js";
+import { handleRazorpayWebhook } from "./controllers/razorpayWebhookController.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const INVOICES_STATIC_DIR =
@@ -84,8 +85,14 @@ app.use(
       "Content-MD5",
       "Date",
       "X-Api-Version",
+      "X-Order-Token",
     ],
   })
+);
+app.post(
+  "/api/webhooks/razorpay",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  handleRazorpayWebhook
 );
 app.post(
   "/api/webhooks/swipe",

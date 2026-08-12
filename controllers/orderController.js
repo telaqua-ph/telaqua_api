@@ -283,9 +283,15 @@ export async function getOrderById(req, res) {
       });
     }
 
+    const {
+      invoice_access_token_hash: _invoiceAccessTokenHash,
+      invoice_attempt_token: _invoiceAttemptToken,
+      ...safeOrder
+    } = rows[0];
+
     return res.status(200).json({
       success: true,
-      order: rows[0],
+      order: safeOrder,
     });
   } catch (error) {
     console.error("Order by id API error:", error);
