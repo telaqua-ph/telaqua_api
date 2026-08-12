@@ -21,6 +21,7 @@ const router = Router();
 router.get("/", requireAuth, listOrders);
 router.post("/", createOrder);
 router.post("/:orderId/invoice", requireAuth, processOrderInvoice);
+router.post("/:orderId/retry-invoice", requireAuth, processOrderInvoice);
 router.get("/:orderId/invoice/download", requireAuth, downloadOrderInvoice);
 router.get("/:id", getOrderById);
 router.put("/:id", requireAuth, updateOrder);

@@ -15,6 +15,15 @@ function getToken() {
   return token;
 }
 
+export function getSwipeConfigurationStatus() {
+  return {
+    apiKeyLoaded: Boolean((process.env.SWIPE_API_KEY || "").trim()),
+    baseUrl: (process.env.SWIPE_BASE_URL || DEFAULT_SWIPE_BASE_URL)
+      .trim()
+      .replace(/\/$/, ""),
+  };
+}
+
 function maskId(id) {
   const value = String(id || "");
   if (value.length <= 8) return "***";
@@ -54,13 +63,12 @@ async function requestSwipe(path, options = {}) {
 }
 
 function buildSafeSwipeError(status, data) {
-  return (
-    data?.message ||
-    data?.error ||
-    data?.error_code ||
-    (data?.errors && JSON.stringify(data.errors).slice(0, 300)) ||
-    `Swipe API error (${status})`
-  );
+  const summary = data?.message || data?.error || data?.error_code ||
+    `Swipe API error`;
+  const details = data?.errors && Object.keys(data.errors).length
+    ? `: ${JSON.stringify(data.errors)}`
+    : "";
+  return `Swipe ${status}: ${summary}${details}`.slice(0, 1000);
 }
 
 function parseJsonMaybe(text) {
@@ -76,10 +84,13 @@ function parseJsonMaybe(text) {
  * @param {object} payload
  */
 export async function createSwipeInvoiceForOrder(order, payload) {
-  console.log("Swipe create invoice started:", {
+  const config = getSwipeConfigurationStatus();
+  console.log("[Invoice] Calling Swipe", {
     orderId: order.id,
     orderNumber: order.order_number,
-    reference: payload.reference,
+    endpoint: `${config.baseUrl}/doc`,
+    method: "POST",
+    apiKeyLoaded: config.apiKeyLoaded,
   });
 
   const response = await requestSwipe("/doc", {
@@ -90,16 +101,23 @@ export async function createSwipeInvoiceForOrder(order, payload) {
   const text = await response.text();
   const data = parseJsonMaybe(text);
 
-  console.log("Swipe create invoice response:", {
+  console.log("[Invoice] Swipe response received", {
     orderId: order.id,
-    status: response.status,
+    httpStatus: response.status,
     ok: response.ok,
+    response: response.ok
+      ? { success: data?.success, hash_id: data?.data?.hash_id ? "present" : "missing", serial_number: data?.data?.serial_number || null }
+      : { message: data?.message, error_code: data?.error_code, errors: data?.errors },
   });
 
   if (!response.ok || data?.success === false) {
     const err = new Error(buildSafeSwipeError(response.status, data));
     err.statusCode = response.status;
-    err.swipeResponse = data;
+    err.safeSwipeResponse = {
+      message: data?.message || null,
+      error_code: data?.error_code || null,
+      errors: data?.errors || null,
+    };
     throw err;
   }
 

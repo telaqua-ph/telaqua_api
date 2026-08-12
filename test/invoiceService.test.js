@@ -75,3 +75,22 @@ test("an inconsistent snapshot is rejected before calling Swipe", () => {
     /financial snapshot is inconsistent/
   );
 });
+
+test("Rs 1 test invoice keeps enough precision for Swipe tax validation", () => {
+  const payload = buildSwipePayload(order({
+    id: 129,
+    order_number: "TEST-000129",
+    is_test_order: true,
+    subtotal: 1,
+    taxable_amount: 0.85,
+    gst_amount: 0.15,
+    final_total: 1,
+    total_amount: 1,
+  }));
+  assert.equal(payload.items[0].unit_price, 0.847458);
+  assert.equal(payload.items[0].price_with_tax, 1);
+  assert.equal(payload.items[0].total_amount, 1);
+  assert.equal(payload.payments[0].amount, 1);
+  assert.equal(payload.items[0].unit, undefined);
+  assert.equal(payload.party.billing_address, undefined);
+});

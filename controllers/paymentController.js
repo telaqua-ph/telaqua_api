@@ -20,6 +20,7 @@ import {
   parseWhatsappConsent,
 } from "../services/whatsappConsent.js";
 import {
+  ensureSwipeInvoiceForPaidOrder,
   getOrderInvoicePdfByOrderId,
   loadOrderForFulfillment,
   processOrderFulfillment,
@@ -440,7 +441,7 @@ export async function getInvoiceStatus(req, res) {
     }
 
     const { order_id, invoice_access_token } = validation.data;
-    const order = await loadOrderForFulfillment(order_id);
+    let order = await loadOrderForFulfillment(order_id);
 
     if (!order) {
       return res.status(404).json({
@@ -479,11 +480,35 @@ export async function getInvoiceStatus(req, res) {
       });
     }
 
-    triggerOrderFulfillmentAsync(order.id);
+    try {
+      const invoice = await ensureSwipeInvoiceForPaidOrder(order.id);
+      order = await loadOrderForFulfillment(order.id);
+      if (invoice.swipe_invoice_id || order?.swipe_invoice_id) {
+        return res.status(200).json({
+          success: true,
+          invoice_ready: true,
+          invoice_status: "generated",
+          invoice_number: order.invoice_number,
+          invoice_url:
+            `/api/payment/invoice-download?order_id=${encodeURIComponent(order.id)}` +
+            `&invoice_access_token=${encodeURIComponent(invoice_access_token)}`,
+          invoice_generated_at: order.invoice_generated_at,
+        });
+      }
+    } catch (error) {
+      order = await loadOrderForFulfillment(order.id);
+      return res.status(502).json({
+        success: false,
+        invoice_ready: false,
+        invoice_status: "failed",
+        message: "Invoice generation failed. Please try again.",
+      });
+    }
 
-    return res.status(200).json({
+    return res.status(202).json({
       success: true,
       invoice_ready: false,
+      invoice_status: String(order?.invoice_status || "pending").toLowerCase(),
       message: "Invoice is being generated",
     });
   } catch (error) {
@@ -516,7 +541,7 @@ export async function downloadCustomerInvoice(req, res) {
       });
     }
 
-    const order = await loadOrderForFulfillment(order_id);
+    let order = await loadOrderForFulfillment(order_id);
     if (!order) {
       return res.status(404).json({
         success: false,
@@ -536,11 +561,33 @@ export async function downloadCustomerInvoice(req, res) {
       });
     }
     if (!order.swipe_invoice_id) {
-      triggerOrderFulfillmentAsync(order.id);
-      return res.status(404).json({
-        success: false,
-        message: "Invoice is not generated yet",
-      });
+      try {
+        const invoice = await ensureSwipeInvoiceForPaidOrder(order.id);
+        order = await loadOrderForFulfillment(order.id);
+        if (invoice.pending && !order?.swipe_invoice_id) {
+          return res.status(202).json({
+            success: true,
+            invoice_ready: false,
+            invoice_status: "pending",
+            message: "Invoice is currently being generated. Please try again shortly.",
+          });
+        }
+      } catch {
+        return res.status(502).json({
+          success: false,
+          invoice_ready: false,
+          invoice_status: "failed",
+          message: "Invoice generation failed. Please try again.",
+        });
+      }
+      if (!order?.swipe_invoice_id) {
+        return res.status(202).json({
+          success: true,
+          invoice_ready: false,
+          invoice_status: String(order?.invoice_status || "pending").toLowerCase(),
+          message: "Invoice is being generated",
+        });
+      }
     }
 
     const pdf = await getOrderInvoicePdfByOrderId(order.id);

@@ -37,6 +37,10 @@ function round2(value) {
   return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
+function round6(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 1_000_000) / 1_000_000;
+}
+
 function formatDate(value = new Date()) {
   const date = value instanceof Date ? value : new Date(value);
   return [
@@ -68,9 +72,11 @@ function buildParty(order) {
     type: "customer",
     name: String(order.customer_name || `Order ${order.id}`),
     email: order.email || undefined,
-    billing_address: buildAddress(order),
-    shipping_address: buildAddress(order),
   };
+  if (!order.is_test_order) {
+    party.billing_address = buildAddress(order);
+    party.shipping_address = buildAddress(order);
+  }
   if (!phone.error) {
     party.country_code = "91";
     party.phone_number = phone.phoneNumber;
@@ -112,21 +118,27 @@ function mapPaymentMethod(value) {
 export function buildSwipePayload(order) {
   const money = getFinancialSnapshot(order);
   const quantity = Math.max(1, Number(order.quantity) || 1);
+  // Swipe validates that unit_price + tax exactly reconciles to price_with_tax.
+  // Keep additional precision for the tax-exclusive API value (especially for
+  // the Rs 1 test invoice); the document still rounds currency to two decimals.
+  const exactTaxable = round6(money.productTotal / (1 + money.rate / 100));
   const productItem = {
     id: `TAQ-PRODUCT-ORDER-${order.id}`,
     name: order.is_test_order
       ? "Tel-Aqua Razorpay Test Product"
       : process.env.TELAQUA_PRODUCT_NAME || "Tel-Aqua PH Meter",
     quantity,
-    unit_price: round2(money.taxable / quantity),
+    unit_price: round6(exactTaxable / quantity),
     tax_rate: money.rate,
     price_with_tax: round2(money.productTotal / quantity),
-    net_amount: money.taxable,
+    net_amount: exactTaxable,
     total_amount: money.productTotal,
     item_type: "Product",
-    unit: "UNT",
-    hsn_code: String(process.env.SWIPE_PRODUCT_HSN || "9027"),
   };
+  if (!order.is_test_order) {
+    productItem.unit = "UNT";
+    productItem.hsn_code = String(process.env.SWIPE_PRODUCT_HSN || "9027");
+  }
   const items = [productItem];
   if (money.shipping > 0) {
     items.push({
@@ -184,9 +196,12 @@ async function claimInvoiceCreation(orderId) {
          swipe_invoice_error = NULL, updated_at = CURRENT_TIMESTAMP
      WHERE id = $1 AND payment_status = 'Paid' AND swipe_invoice_id IS NULL
        AND (
-         invoice_status IS NULL OR invoice_status IN ('not_created', 'failed')
-         OR (invoice_status = 'pending' AND
-             invoice_processing_started_at < NOW() - INTERVAL '5 minutes')
+         invoice_status IS NULL
+         OR LOWER(invoice_status) IN ('not_created', 'not created', 'failed')
+         OR (LOWER(invoice_status) = 'pending' AND (
+             invoice_processing_started_at IS NULL
+             OR invoice_processing_started_at < NOW() - INTERVAL '5 minutes'
+         ))
        )
      RETURNING id`,
     [orderId, token]
@@ -195,6 +210,7 @@ async function claimInvoiceCreation(orderId) {
 }
 
 export async function ensureSwipeInvoiceForPaidOrder(orderId) {
+  console.log(`[Invoice] Starting for order ${orderId}`);
   let order = await loadOrderForFulfillment(orderId);
   if (!order) {
     const error = new Error("Order not found");
@@ -206,7 +222,21 @@ export async function ensureSwipeInvoiceForPaidOrder(orderId) {
     error.statusCode = 400;
     throw error;
   }
-  if (order.swipe_invoice_id) return existingInvoice(order);
+  console.log(`[Invoice] Order is PAID: ${order.order_number || order.id}`);
+  if (order.swipe_invoice_id) {
+    if (String(order.invoice_status || "").toLowerCase() !== "generated") {
+      await query(
+        `UPDATE orders SET invoice_status = 'generated',
+           invoice_generated_at = COALESCE(invoice_generated_at, CURRENT_TIMESTAMP),
+           swipe_invoice_error = NULL, invoice_attempt_token = NULL,
+           invoice_processing_started_at = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [order.id]
+      );
+      order = await loadOrderForFulfillment(order.id);
+    }
+    return existingInvoice(order);
+  }
 
   const attemptToken = await claimInvoiceCreation(order.id);
   if (!attemptToken) {
@@ -215,7 +245,7 @@ export async function ensureSwipeInvoiceForPaidOrder(orderId) {
     return { ...existingInvoice(order), pending: true };
   }
 
-  console.log(`Swipe invoice creation started for ${order.order_number || order.id}`);
+  console.log(`[Invoice] Calling Swipe for ${order.order_number || order.id}`);
   try {
     const result = await createSwipeInvoiceForOrder(order, buildSwipePayload(order));
     const hashId = String(result?.data?.hash_id || "");
@@ -247,10 +277,18 @@ export async function ensureSwipeInvoiceForPaidOrder(orderId) {
       [serialNumber, `/api/orders/${order.id}/invoice/download`, hashId, order.id, attemptToken]
     );
     if (!rows.length) throw new Error("Invoice claim was lost before it could be saved");
-    console.log(`Swipe invoice ${serialNumber || hashId} created for ${order.order_number || order.id}`);
+    const confirmed = await loadOrderForFulfillment(order.id);
+    if (
+      !confirmed?.swipe_invoice_id ||
+      String(confirmed.invoice_status || "").toLowerCase() !== "generated"
+    ) {
+      throw new Error("Swipe invoice was created but database confirmation failed");
+    }
+    console.log(`[Invoice] Invoice generated: ${serialNumber || hashId}`);
+    console.log(`[Invoice] Database updated for ${order.order_number || order.id}`);
     return { ...rows[0], created: true, pending: false };
   } catch (error) {
-    const safeError = String(error?.message || "Swipe invoice creation failed").slice(0, 500);
+    const safeError = String(error?.message || "Swipe invoice creation failed").slice(0, 1000);
     await query(
       `UPDATE orders SET invoice_status = 'failed', swipe_invoice_error = $3,
          invoice_attempt_token = NULL, invoice_processing_started_at = NULL,
