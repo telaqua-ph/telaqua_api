@@ -1,22 +1,40 @@
 import { sendInteraktTemplate } from "./interaktService.js";
 
-export function getInteraktOtpConfigurationStatus() {
+function otpTemplateConfiguration() {
+  const preferredName = String(
+    process.env.INTERAKT_AUTH_TEMPLATE_NAME || ""
+  ).trim();
+  const legacyName = String(
+    process.env.INTERAKT_OTP_TEMPLATE_NAME || ""
+  ).trim();
+  const preferredLanguage = String(
+    process.env.INTERAKT_AUTH_TEMPLATE_LANGUAGE || ""
+  ).trim();
+  const legacyLanguage = String(
+    process.env.INTERAKT_OTP_LANGUAGE_CODE || ""
+  ).trim();
   return {
-    templateConfigured: Boolean(
-      String(process.env.INTERAKT_OTP_TEMPLATE_NAME || "").trim()
-    ),
-    templateName: String(process.env.INTERAKT_OTP_TEMPLATE_NAME || "").trim() || null,
-    languageCode: String(process.env.INTERAKT_OTP_LANGUAGE_CODE || "en").trim(),
+    templateName: preferredName || legacyName,
+    languageCode: preferredLanguage || legacyLanguage || "en",
+    configurationSource: preferredName ? "INTERAKT_AUTH_TEMPLATE_NAME" :
+      legacyName ? "INTERAKT_OTP_TEMPLATE_NAME" : null,
+  };
+}
+
+export function getInteraktOtpConfigurationStatus() {
+  const configuration = otpTemplateConfiguration();
+  return {
+    templateConfigured: Boolean(configuration.templateName),
+    templateName: configuration.templateName || null,
+    languageCode: configuration.languageCode,
+    configurationSource: configuration.configurationSource,
   };
 }
 
 export async function sendOtp(phone, otp) {
-  const templateName = String(process.env.INTERAKT_OTP_TEMPLATE_NAME || "").trim();
-  const languageCode = String(
-    process.env.INTERAKT_OTP_LANGUAGE_CODE || "en"
-  ).trim();
+  const { templateName, languageCode } = otpTemplateConfiguration();
   if (!templateName) {
-    throw new Error("INTERAKT_OTP_TEMPLATE_NAME is not configured");
+    throw new Error("Interakt authentication template is not configured");
   }
 
   // Interakt authentication templates require the same code in the body and
@@ -24,7 +42,7 @@ export async function sendOtp(phone, otp) {
   return sendInteraktTemplate({
     countryCode: "+91",
     phoneNumber: phone,
-    callbackData: "customer-login-otp",
+    callbackData: "website_otp_login",
     template: {
       name: templateName,
       languageCode,

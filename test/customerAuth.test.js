@@ -91,3 +91,32 @@ test("Interakt OTP request uses authentication body and button values", async ()
     else process.env.INTERAKT_OTP_TEMPLATE_NAME = originalTemplate;
   }
 });
+
+test("preferred Interakt authentication template configuration takes precedence", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.INTERAKT_API_KEY;
+  const originalPreferred = process.env.INTERAKT_AUTH_TEMPLATE_NAME;
+  const originalLegacy = process.env.INTERAKT_OTP_TEMPLATE_NAME;
+  let captured;
+  process.env.INTERAKT_API_KEY = "test-interakt-key";
+  process.env.INTERAKT_AUTH_TEMPLATE_NAME = "approved_auth_template";
+  process.env.INTERAKT_OTP_TEMPLATE_NAME = "legacy_template";
+  globalThis.fetch = async (_url, options) => {
+    captured = JSON.parse(options.body);
+    return new Response(JSON.stringify({ id: "message-2" }), { status: 200 });
+  };
+  try {
+    await sendOtp("9876543210", "654321");
+    assert.equal(captured.template.name, "approved_auth_template");
+    assert.deepEqual(captured.template.bodyValues, ["654321"]);
+    assert.deepEqual(captured.template.buttonValues, { "0": ["654321"] });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.INTERAKT_API_KEY;
+    else process.env.INTERAKT_API_KEY = originalKey;
+    if (originalPreferred === undefined) delete process.env.INTERAKT_AUTH_TEMPLATE_NAME;
+    else process.env.INTERAKT_AUTH_TEMPLATE_NAME = originalPreferred;
+    if (originalLegacy === undefined) delete process.env.INTERAKT_OTP_TEMPLATE_NAME;
+    else process.env.INTERAKT_OTP_TEMPLATE_NAME = originalLegacy;
+  }
+});

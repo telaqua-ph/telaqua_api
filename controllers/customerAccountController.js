@@ -52,7 +52,11 @@ function validatePhone(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { error: "Invalid JSON body" };
   }
-  const normalized = normalizeIndianPhone(body.phone);
+  const countryCode = String(body.countryCode || "+91").replace(/\s/g, "");
+  if (body.phoneNumber !== undefined && countryCode !== "+91" && countryCode !== "91") {
+    return { error: "Enter a valid Indian mobile number" };
+  }
+  const normalized = normalizeIndianPhone(body.phone ?? body.phoneNumber);
   if (normalized.error) return { error: "Enter a valid Indian mobile number" };
   return { phone: normalized.phoneNumber };
 }
