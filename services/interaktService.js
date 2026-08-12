@@ -10,6 +10,23 @@ const TEMPLATE_NAME = "telaqua_order_invoice";
 const TEMPLATE_LANGUAGE = "en";
 const REQUEST_TIMEOUT_MS = 30000;
 
+export function getInteraktConfigurationStatus() {
+  return {
+    apiKeyLoaded: Boolean(String(process.env.INTERAKT_API_KEY || "").trim()),
+    endpoint: INTERAKT_API_URL,
+  };
+}
+
+function safeInteraktError(status, data) {
+  return {
+    httpStatus: status,
+    message: String(data?.message || data?.error || data?.detail || "Unknown Interakt error")
+      .slice(0, 500),
+    code: data?.code || data?.errorCode || data?.error_code || null,
+    result: data?.result ?? data?.success ?? null,
+  };
+}
+
 function maskPhone(phone) {
   const s = String(phone || "");
   if (s.length <= 4) return "****";
@@ -75,6 +92,9 @@ export async function sendInteraktTemplate({
     console.log("Interakt response received:", {
       status: response.status,
       ok: response.ok,
+      ...(response.ok && data?.success !== false && data?.result !== false
+        ? {}
+        : { error: safeInteraktError(response.status, data) }),
     });
 
     if (!response.ok || data?.success === false || data?.result === false) {
@@ -86,6 +106,7 @@ export async function sendInteraktTemplate({
       const err = new Error(safeMessage);
       err.statusCode = response.ok ? 502 : response.status;
       err.interaktResponse = data;
+      err.safeInteraktError = safeInteraktError(response.status, data);
       throw err;
     }
 

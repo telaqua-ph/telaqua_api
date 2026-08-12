@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   getCustomerOrder,
+  getCustomerOtpProviderStatus,
   getCustomerProfile,
   getRecentCustomerOrder,
   listCustomerOrders,
@@ -10,6 +11,7 @@ import {
   verifyCustomerOtp,
 } from "../controllers/customerAccountController.js";
 import { requireCustomerAuth } from "../middleware/customerAuth.js";
+import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 const asyncRoute = (handler) => (req, res, next) =>
@@ -17,6 +19,7 @@ const asyncRoute = (handler) => (req, res, next) =>
 
 router.post("/auth/request-otp", asyncRoute(requestCustomerOtp));
 router.post("/auth/verify-otp", asyncRoute(verifyCustomerOtp));
+router.get("/auth/interakt-status", requireAuth, asyncRoute(getCustomerOtpProviderStatus));
 router.post("/auth/logout", asyncRoute(requireCustomerAuth), asyncRoute(logoutCustomer));
 router.get("/profile", asyncRoute(requireCustomerAuth), asyncRoute(getCustomerProfile));
 router.get("/orders", asyncRoute(requireCustomerAuth), asyncRoute(listCustomerOrders));

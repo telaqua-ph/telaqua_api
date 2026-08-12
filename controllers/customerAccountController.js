@@ -9,7 +9,11 @@ import {
   verifyOtpHash,
 } from "../lib/customerAuth.js";
 import { normalizeIndianPhone } from "../utils/phoneUtils.js";
-import { sendOtp } from "../services/interaktOtpService.js";
+import {
+  getInteraktOtpConfigurationStatus,
+  sendOtp,
+} from "../services/interaktOtpService.js";
+import { getInteraktConfigurationStatus } from "../services/interaktService.js";
 import { trackShipment } from "../services/delhiveryService.js";
 
 const OTP_EXPIRY_MINUTES = 5;
@@ -194,12 +198,33 @@ export async function requestCustomerOtp(req, res) {
       `UPDATE customer_auth_otps SET invalidated_at = CURRENT_TIMESTAMP WHERE id = $1`,
       [otpId]
     ).catch(() => {});
-    console.error("Customer OTP delivery failed:", error?.message || error);
+    console.error("Customer OTP delivery failed:", {
+      message: error?.message || String(error),
+      code: error?.code || null,
+      status: error?.statusCode || null,
+      interakt: error?.safeInteraktError || null,
+      // Configuration booleans only; never log the API key or OTP.
+      config: {
+        ...getInteraktConfigurationStatus(),
+        ...getInteraktOtpConfigurationStatus(),
+      },
+    });
     return res.status(502).json({
       success: false,
       message: "Unable to send WhatsApp OTP. Please try again later.",
     });
   }
+}
+
+/** GET /api/customer/auth/interakt-status (admin only via router) */
+export async function getCustomerOtpProviderStatus(req, res) {
+  return res.status(200).json({
+    success: true,
+    interakt: {
+      ...getInteraktConfigurationStatus(),
+      ...getInteraktOtpConfigurationStatus(),
+    },
+  });
 }
 
 /** POST /api/customer/auth/verify-otp */

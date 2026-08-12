@@ -1,5 +1,15 @@
 import { sendInteraktTemplate } from "./interaktService.js";
 
+export function getInteraktOtpConfigurationStatus() {
+  return {
+    templateConfigured: Boolean(
+      String(process.env.INTERAKT_OTP_TEMPLATE_NAME || "").trim()
+    ),
+    templateName: String(process.env.INTERAKT_OTP_TEMPLATE_NAME || "").trim() || null,
+    languageCode: String(process.env.INTERAKT_OTP_LANGUAGE_CODE || "en").trim(),
+  };
+}
+
 export async function sendOtp(phone, otp) {
   const templateName = String(process.env.INTERAKT_OTP_TEMPLATE_NAME || "").trim();
   const languageCode = String(
