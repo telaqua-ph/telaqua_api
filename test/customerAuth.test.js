@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   generateOtp,
+  getCustomerAuthConfigurationStatus,
   hashOtp,
   signCustomerToken,
   verifyCustomerToken,
@@ -55,6 +56,30 @@ test("customer JWT is typed, scoped and includes a revocable token id", () => {
   } finally {
     if (originalSecret === undefined) delete process.env.CUSTOMER_AUTH_SECRET;
     else process.env.CUSTOMER_AUTH_SECRET = originalSecret;
+  }
+});
+
+test("an unusable dedicated customer secret safely falls back to a usable JWT secret", () => {
+  const originalCustomerSecret = process.env.CUSTOMER_AUTH_SECRET;
+  const originalJwtSecret = process.env.JWT_SECRET;
+  process.env.CUSTOMER_AUTH_SECRET = "too-short";
+  process.env.JWT_SECRET = "usable-jwt-fallback-secret-at-least-24";
+  try {
+    const status = getCustomerAuthConfigurationStatus();
+    assert.equal(status.dedicatedSecretConfigured, true);
+    assert.equal(status.dedicatedSecretUsable, false);
+    assert.equal(status.jwtFallbackUsable, true);
+    assert.equal(status.selectedSource, "JWT_SECRET");
+    const token = signCustomerToken({
+      phone: "9876543210",
+      tokenId: "94a06165-1c34-4012-8008-51bdf91ff5aa",
+    });
+    assert.equal(verifyCustomerToken(token).phone, "9876543210");
+  } finally {
+    if (originalCustomerSecret === undefined) delete process.env.CUSTOMER_AUTH_SECRET;
+    else process.env.CUSTOMER_AUTH_SECRET = originalCustomerSecret;
+    if (originalJwtSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = originalJwtSecret;
   }
 });
 

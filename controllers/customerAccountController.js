@@ -3,6 +3,7 @@ import { pool, query } from "../config/db.js";
 import {
   customerSessionExpiry,
   generateOtp,
+  getCustomerAuthConfigurationStatus,
   hashOtp,
   hashRequestIp,
   signCustomerToken,
@@ -148,12 +149,16 @@ export async function requestCustomerOtp(req, res) {
   }
 
   const phone = validated.phone;
-  const otp = generateOtp();
-  const otpHash = hashOtp(phone, otp);
-  const ipHash = hashRequestIp(req.ip);
-  const client = await pool.connect();
+  let otp;
+  let otpHash;
+  let ipHash;
+  let client;
   let otpId;
   try {
+    otp = generateOtp();
+    otpHash = hashOtp(phone, otp);
+    ipHash = hashRequestIp(req.ip);
+    client = await pool.connect();
     await client.query("BEGIN");
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [phone]);
     const rate = await client.query(
@@ -198,11 +203,18 @@ export async function requestCustomerOtp(req, res) {
     otpId = inserted.rows[0].id;
     await client.query("COMMIT");
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("Customer OTP request database error:", error?.message || error);
-    return res.status(500).json({ success: false, message: "Unable to request OTP" });
+    if (client) await client.query("ROLLBACK").catch(() => {});
+    console.error("Customer OTP request initialization/database error:", {
+      message: error?.message || String(error),
+      code: error?.code || null,
+      authConfig: getCustomerAuthConfigurationStatus(),
+    });
+    return res.status(503).json({
+      success: false,
+      message: "Customer authentication is temporarily unavailable",
+    });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 
   try {
@@ -242,6 +254,7 @@ export async function getCustomerOtpProviderStatus(req, res) {
     interakt: {
       ...getInteraktConfigurationStatus(),
       ...getInteraktOtpConfigurationStatus(),
+      customerAuth: getCustomerAuthConfigurationStatus(),
     },
   });
 }
