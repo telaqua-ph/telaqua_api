@@ -7,6 +7,7 @@
 import {
   getOrderInvoicePdfByOrderId,
   processOrderFulfillment,
+  refreshSwipeInvoiceHsn,
 } from "../services/invoiceService.js";
 
 function parseOrderId(raw) {
@@ -98,6 +99,29 @@ export async function downloadOrderInvoice(req, res) {
     return res.status(500).json({
       success: false,
       message: "Failed to download invoice",
+    });
+  }
+}
+
+/** POST /api/orders/:orderId/invoice/refresh-hsn (admin only via router) */
+export async function refreshOrderInvoiceHsn(req, res) {
+  try {
+    const orderId = parseOrderId(req.params.orderId);
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: "Invalid order id" });
+    }
+    const invoice = await refreshSwipeInvoiceHsn(orderId);
+    return res.status(200).json({
+      success: true,
+      message: "Invoice HSN updated",
+      invoice,
+    });
+  } catch (error) {
+    console.error("Refresh order invoice HSN error:", error?.message || error);
+    const status = error?.statusCode || 500;
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      success: false,
+      message: error?.message || "Failed to update invoice HSN",
     });
   }
 }

@@ -38,6 +38,7 @@ test("discounted taxable value, GST, Razorpay payment and Swipe total match", ()
   assert.equal(payload.items[0].net_amount, 1800);
   assert.equal(payload.items[0].total_amount, 2124);
   assert.equal(payload.items[0].tax_rate, 18);
+  assert.equal(payload.items[0].hsn_code, "90314900");
   assert.equal(payload.payments[0].amount, 2124);
   assert.match(payload.reference, /TAQ-001058/);
   assert.match(payload.reference, /pay_test123/);
@@ -92,7 +93,8 @@ test("Rs 1 test invoice keeps enough precision for Swipe tax validation", () => 
   assert.equal(payload.items[0].price_with_tax, 1);
   assert.equal(payload.items[0].total_amount, 1);
   assert.equal(payload.payments[0].amount, 1);
-  assert.equal(payload.items[0].unit, undefined);
+  assert.equal(payload.items[0].unit, "UNT");
+  assert.equal(payload.items[0].hsn_code, "90314900");
   assert.equal(payload.party.billing_address, undefined);
 });
 

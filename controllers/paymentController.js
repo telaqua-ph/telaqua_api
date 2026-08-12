@@ -369,6 +369,22 @@ function isValidInvoiceAccessToken(order, token) {
     crypto.timingSafeEqual(left, right);
 }
 
+function hasCustomerInvoiceAccess(order, invoiceAccessToken, razorpayPaymentId) {
+  if (invoiceAccessToken && isValidInvoiceAccessToken(order, invoiceAccessToken)) {
+    return true;
+  }
+
+  // Backward compatibility for payment-result pages deployed before guest invoice
+  // tokens were added. Razorpay payment IDs are high-entropy and are compared only
+  // against the exact payment ID already stored for this order.
+  const expectedPaymentId = String(order?.razorpay_payment_id || "");
+  const suppliedPaymentId = String(razorpayPaymentId || "");
+  const left = Buffer.from(expectedPaymentId, "utf8");
+  const right = Buffer.from(suppliedPaymentId, "utf8");
+  return left.length === right.length && left.length > 0 &&
+    crypto.timingSafeEqual(left, right);
+}
+
 function buildVerifySuccessResponse(order, message) {
   const isTest = Boolean(order.is_test_order);
   return {
@@ -413,18 +429,20 @@ function validateInvoiceStatusPayload(body) {
 
   const order_id = parsePositiveOrderId(body.order_id);
   const invoice_access_token = trimStr(body.invoice_access_token);
+  const razorpay_payment_id = trimStr(body.razorpay_payment_id);
 
   if (!order_id) {
     return { error: "order_id must be a positive integer" };
   }
-  if (!invoice_access_token) {
-    return { error: "invoice_access_token is required" };
+  if (!invoice_access_token && !razorpay_payment_id) {
+    return { error: "invoice_access_token or razorpay_payment_id is required" };
   }
 
   return {
     data: {
       order_id,
-      invoice_access_token: String(invoice_access_token),
+      invoice_access_token: invoice_access_token ? String(invoice_access_token) : null,
+      razorpay_payment_id: razorpay_payment_id ? String(razorpay_payment_id) : null,
     },
   };
 }
@@ -440,7 +458,7 @@ export async function getInvoiceStatus(req, res) {
       });
     }
 
-    const { order_id, invoice_access_token } = validation.data;
+    const { order_id, invoice_access_token, razorpay_payment_id } = validation.data;
     let order = await loadOrderForFulfillment(order_id);
 
     if (!order) {
@@ -450,7 +468,7 @@ export async function getInvoiceStatus(req, res) {
       });
     }
 
-    if (!isValidInvoiceAccessToken(order, invoice_access_token)) {
+    if (!hasCustomerInvoiceAccess(order, invoice_access_token, razorpay_payment_id)) {
       return res.status(403).json({
         success: false,
         message: "You are not allowed to access this order",
@@ -473,9 +491,9 @@ export async function getInvoiceStatus(req, res) {
         success: true,
         invoice_ready: true,
         invoice_number: order.invoice_number,
-        invoice_url:
-          `/api/payment/invoice-download?order_id=${encodeURIComponent(order.id)}` +
-          `&invoice_access_token=${encodeURIComponent(invoice_access_token)}`,
+        invoice_url: buildCustomerInvoiceUrl(
+          order.id, invoice_access_token, razorpay_payment_id
+        ),
         invoice_generated_at: order.invoice_generated_at,
       });
     }
@@ -489,9 +507,9 @@ export async function getInvoiceStatus(req, res) {
           invoice_ready: true,
           invoice_status: "generated",
           invoice_number: order.invoice_number,
-          invoice_url:
-            `/api/payment/invoice-download?order_id=${encodeURIComponent(order.id)}` +
-            `&invoice_access_token=${encodeURIComponent(invoice_access_token)}`,
+          invoice_url: buildCustomerInvoiceUrl(
+            order.id, invoice_access_token, razorpay_payment_id
+          ),
           invoice_generated_at: order.invoice_generated_at,
         });
       }
@@ -520,6 +538,13 @@ export async function getInvoiceStatus(req, res) {
   }
 }
 
+function buildCustomerInvoiceUrl(orderId, invoiceAccessToken, razorpayPaymentId) {
+  const query = new URLSearchParams({ order_id: String(orderId) });
+  if (invoiceAccessToken) query.set("invoice_access_token", invoiceAccessToken);
+  else query.set("razorpay_payment_id", razorpayPaymentId);
+  return `/api/payment/invoice-download?${query.toString()}`;
+}
+
 /** GET /api/payment/invoice-download?order_id=&invoice_access_token= */
 export async function downloadCustomerInvoice(req, res) {
   try {
@@ -527,6 +552,7 @@ export async function downloadCustomerInvoice(req, res) {
     const invoice_access_token = trimStr(
       req.headers["x-order-token"] || req.query.invoice_access_token
     );
+    const razorpay_payment_id = trimStr(req.query.razorpay_payment_id);
 
     if (!order_id) {
       return res.status(400).json({
@@ -534,10 +560,10 @@ export async function downloadCustomerInvoice(req, res) {
         message: "order_id must be a positive integer",
       });
     }
-    if (!invoice_access_token) {
+    if (!invoice_access_token && !razorpay_payment_id) {
       return res.status(400).json({
         success: false,
-        message: "invoice_access_token is required",
+        message: "invoice_access_token or razorpay_payment_id is required",
       });
     }
 
@@ -548,7 +574,7 @@ export async function downloadCustomerInvoice(req, res) {
         message: "Order not found",
       });
     }
-    if (!isValidInvoiceAccessToken(order, invoice_access_token)) {
+    if (!hasCustomerInvoiceAccess(order, invoice_access_token, razorpay_payment_id)) {
       return res.status(403).json({
         success: false,
         message: "You are not allowed to access this order",

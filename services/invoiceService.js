@@ -10,6 +10,7 @@ import {
   createSwipeInvoiceForOrder,
   getSwipeInvoiceDetails,
   getSwipeInvoicePdf,
+  updateSwipeInvoiceForOrder,
 } from "./swipeService.js";
 
 const ORDER_SELECT = `
@@ -134,11 +135,9 @@ export function buildSwipePayload(order) {
     net_amount: exactTaxable,
     total_amount: money.productTotal,
     item_type: "Product",
+    unit: "UNT",
+    hsn_code: String(process.env.SWIPE_PRODUCT_HSN || "90314900"),
   };
-  if (!order.is_test_order) {
-    productItem.unit = "UNT";
-    productItem.hsn_code = String(process.env.SWIPE_PRODUCT_HSN || "9027");
-  }
   const items = [productItem];
   if (money.shipping > 0) {
     items.push({
@@ -316,6 +315,59 @@ export async function getOrderInvoicePdfByOrderId(orderId) {
     throw error;
   }
   return getSwipeInvoicePdf(order.swipe_invoice_id);
+}
+
+export async function refreshSwipeInvoiceHsn(orderId) {
+  const order = await loadOrderForFulfillment(orderId);
+  if (!order) {
+    const error = new Error("Order not found");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (String(order.payment_status).trim() !== "Paid") {
+    const error = new Error("Order payment is not completed");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!order.swipe_invoice_id) {
+    const error = new Error("Swipe invoice has not been generated");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const expectedHsn = String(process.env.SWIPE_PRODUCT_HSN || "90314900");
+  const before = await getSwipeInvoiceDetails(order.swipe_invoice_id);
+  const invoiceDetails = before?.data?.invoice_details || before?.data || {};
+  const payload = buildSwipePayload(order);
+
+  // Keep the master records already attached to this document. Updating by the
+  // existing hash is what prevents a second Swipe invoice from being created.
+  const existingPartyId = invoiceDetails?.party?.id || invoiceDetails?.customer?.id;
+  const existingProductId = invoiceDetails?.items?.[0]?.id;
+  if (existingPartyId) payload.party.id = existingPartyId;
+  if (existingProductId) payload.items[0].id = existingProductId;
+
+  // Editing an existing invoice must not resend customer notifications or add a
+  // second Razorpay payment entry.
+  payload.send_wtsp = false;
+  payload.send_sms = false;
+  delete payload.payments;
+
+  await updateSwipeInvoiceForOrder(order, order.swipe_invoice_id, payload);
+  const after = await getSwipeInvoiceDetails(order.swipe_invoice_id);
+  const savedDetails = after?.data?.invoice_details || after?.data || {};
+  const savedHsn = String(savedDetails?.items?.[0]?.hsn_code || "");
+  if (savedHsn !== expectedHsn) {
+    const error = new Error("Swipe invoice update did not persist the expected HSN code");
+    error.statusCode = 502;
+    throw error;
+  }
+
+  return {
+    invoice_number: order.invoice_number,
+    swipe_invoice_id: order.swipe_invoice_id,
+    hsn_code: savedHsn,
+  };
 }
 
 export async function processOrderFulfillment(orderId) {

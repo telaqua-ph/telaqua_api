@@ -205,6 +205,51 @@ export async function getSwipeInvoiceDetails(hashId) {
 }
 
 /**
+ * Update an existing Swipe document without creating a duplicate invoice.
+ * @param {object} order
+ * @param {string} hashId
+ * @param {object} payload
+ */
+export async function updateSwipeInvoiceForOrder(order, hashId, payload) {
+  const config = getSwipeConfigurationStatus();
+  console.log("[Invoice] Updating Swipe invoice", {
+    orderId: order.id,
+    orderNumber: order.order_number,
+    endpoint: `${config.baseUrl}/doc/{hash_id}`,
+    method: "PUT",
+    apiKeyLoaded: config.apiKeyLoaded,
+  });
+
+  const response = await requestSwipe(`/doc/${encodeURIComponent(hashId)}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  const data = parseJsonMaybe(await response.text());
+
+  console.log("[Invoice] Swipe update response received", {
+    orderId: order.id,
+    httpStatus: response.status,
+    ok: response.ok,
+    response: response.ok
+      ? { success: data?.success }
+      : { message: data?.message, error_code: data?.error_code, errors: data?.errors },
+  });
+
+  if (!response.ok || data?.success === false) {
+    const err = new Error(buildSafeSwipeError(response.status, data));
+    err.statusCode = response.status;
+    err.safeSwipeResponse = {
+      message: data?.message || null,
+      error_code: data?.error_code || null,
+      errors: data?.errors || null,
+    };
+    throw err;
+  }
+
+  return data;
+}
+
+/**
  * @param {string} hashId
  */
 export async function getSwipeInvoicePdf(hashId) {

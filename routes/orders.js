@@ -13,6 +13,7 @@ import {
 import {
   downloadOrderInvoice,
   processOrderInvoice,
+  refreshOrderInvoiceHsn,
 } from "../controllers/invoiceController.js";
 import { requireAuth } from "../middleware/auth.js";
 
@@ -22,6 +23,7 @@ router.get("/", requireAuth, listOrders);
 router.post("/", createOrder);
 router.post("/:orderId/invoice", requireAuth, processOrderInvoice);
 router.post("/:orderId/retry-invoice", requireAuth, processOrderInvoice);
+router.post("/:orderId/invoice/refresh-hsn", requireAuth, refreshOrderInvoiceHsn);
 router.get("/:orderId/invoice/download", requireAuth, downloadOrderInvoice);
 router.get("/:id", getOrderById);
 router.put("/:id", requireAuth, updateOrder);
