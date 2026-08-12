@@ -118,6 +118,21 @@ async function loadOwnedOrder(orderId, phone) {
   return rows[0] || null;
 }
 
+async function missingOwnedOrderResponse(orderId, res) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(404).json({ success: false, message: "Order not found" });
+  }
+  const { rowCount } = await query("SELECT 1 FROM orders WHERE id = $1 LIMIT 1", [id]);
+  if (rowCount > 0) {
+    return res.status(403).json({
+      success: false,
+      message: "You are not allowed to access this order",
+    });
+  }
+  return res.status(404).json({ success: false, message: "Order not found" });
+}
+
 /** POST /api/customer/auth/request-otp */
 export async function requestCustomerOtp(req, res) {
   if (!isSecureRequest(req)) {
@@ -385,7 +400,7 @@ export async function getRecentCustomerOrder(req, res) {
 export async function getCustomerOrder(req, res) {
   const order = await loadOwnedOrder(req.params.orderId, req.customer.phone);
   if (!order) {
-    return res.status(404).json({ success: false, message: "Order not found" });
+    return missingOwnedOrderResponse(req.params.orderId, res);
   }
   return res.status(200).json({ success: true, order: safeOrder(order, req, true) });
 }
@@ -416,7 +431,7 @@ function safeTracking(data, order) {
 export async function trackCustomerOrder(req, res) {
   const order = await loadOwnedOrder(req.params.orderId, req.customer.phone);
   if (!order) {
-    return res.status(404).json({ success: false, message: "Order not found" });
+    return missingOwnedOrderResponse(req.params.orderId, res);
   }
   if (!order.waybill) {
     return res.status(200).json({

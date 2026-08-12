@@ -625,7 +625,10 @@ export async function downloadCustomerInvoice(req, res) {
       authenticatedCustomer &&
       !orderBelongsToCustomer(order, authenticatedCustomer.phone)
     ) {
-      return res.status(404).json({ success: false, message: "Order not found" });
+      return res.status(403).json({
+        success: false,
+        message: "You are not allowed to access this order",
+      });
     }
     if (
       !authenticatedCustomer &&

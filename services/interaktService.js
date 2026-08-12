@@ -9,11 +9,13 @@ const INTERAKT_API_URL = "https://api.interakt.ai/v1/public/message/";
 const TEMPLATE_NAME = "telaqua_order_invoice";
 const TEMPLATE_LANGUAGE = "en";
 const REQUEST_TIMEOUT_MS = 30000;
+let lastInteraktResult = null;
 
 export function getInteraktConfigurationStatus() {
   return {
     apiKeyLoaded: Boolean(String(process.env.INTERAKT_API_KEY || "").trim()),
     endpoint: INTERAKT_API_URL,
+    lastResult: lastInteraktResult,
   };
 }
 
@@ -51,6 +53,13 @@ export async function sendInteraktTemplate({
 }) {
   const apiKey = (process.env.INTERAKT_API_KEY || "").trim();
   if (!apiKey) {
+    lastInteraktResult = {
+      ok: false,
+      httpStatus: null,
+      message: "INTERAKT_API_KEY is not configured",
+      code: "INTERAKT_CONFIG_ERROR",
+      at: new Date().toISOString(),
+    };
     throw new Error("INTERAKT_API_KEY is not configured");
   }
 
@@ -98,6 +107,11 @@ export async function sendInteraktTemplate({
     });
 
     if (!response.ok || data?.success === false || data?.result === false) {
+      lastInteraktResult = {
+        ok: false,
+        ...safeInteraktError(response.status, data),
+        at: new Date().toISOString(),
+      };
       const safeMessage =
         data?.message ||
         data?.error ||
@@ -123,6 +137,13 @@ export async function sendInteraktTemplate({
       messageId: messageId ? String(messageId).slice(0, 12) + "…" : null,
     });
 
+    lastInteraktResult = {
+      ok: true,
+      httpStatus: response.status,
+      messageIdPresent: Boolean(messageId),
+      at: new Date().toISOString(),
+    };
+
     return {
       success: true,
       messageId,
@@ -130,9 +151,25 @@ export async function sendInteraktTemplate({
     };
   } catch (error) {
     if (error.name === "AbortError") {
+      lastInteraktResult = {
+        ok: false,
+        httpStatus: null,
+        message: "Interakt API request timed out",
+        code: "INTERAKT_TIMEOUT",
+        at: new Date().toISOString(),
+      };
       const err = new Error("Interakt API request timed out");
       err.code = "INTERAKT_TIMEOUT";
       throw err;
+    }
+    if (!lastInteraktResult || lastInteraktResult.ok) {
+      lastInteraktResult = {
+        ok: false,
+        httpStatus: null,
+        message: String(error?.message || "Interakt request failed").slice(0, 500),
+        code: error?.code || "INTERAKT_REQUEST_ERROR",
+        at: new Date().toISOString(),
+      };
     }
     console.error("WhatsApp failed:", error?.message || error);
     throw error;
