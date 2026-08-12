@@ -257,23 +257,26 @@ export async function getSwipeInvoicePdf(hashId) {
     method: "GET",
   });
 
-  if (!response.ok) {
-    let data = {};
-    try {
-      data = await response.json();
-    } catch {
-      data = {};
-    }
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const contentType = response.headers.get("content-type") || "";
+  const isPdf = contentType.toLowerCase().includes("application/pdf") ||
+    buffer.subarray(0, 5).toString("ascii") === "%PDF-";
+
+  // Swipe can return HTTP 200 with a JSON { success: false } quota/error body.
+  // Never forward that response to the browser under an application/pdf header.
+  if (!response.ok || !isPdf) {
+    const data = parseJsonMaybe(buffer.toString("utf8"));
     const err = new Error(buildSafeSwipeError(response.status, data));
-    err.statusCode = response.status;
+    err.statusCode = response.ok ? 502 : response.status;
+    err.upstreamStatusCode = response.status;
     err.swipeResponse = data;
     throw err;
   }
 
-  const arrayBuffer = await response.arrayBuffer();
   return {
-    buffer: Buffer.from(arrayBuffer),
-    contentType: response.headers.get("content-type") || "application/pdf",
+    buffer,
+    contentType: contentType || "application/pdf",
     fileName: `${maskId(hashId)}.pdf`,
   };
 }

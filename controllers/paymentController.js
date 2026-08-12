@@ -636,9 +636,11 @@ export async function downloadCustomerInvoice(req, res) {
         message: error.message || "Invoice not found",
       });
     }
-    return res.status(500).json({
+    return res.status(status === 502 ? 502 : 500).json({
       success: false,
-      message: "Failed to download invoice",
+      message: status === 502
+        ? error.message
+        : "Failed to download invoice",
     });
   }
 }

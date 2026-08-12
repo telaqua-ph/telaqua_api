@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildSwipePayload } from "../services/invoiceService.js";
-import { createSwipeInvoiceForOrder } from "../services/swipeService.js";
+import {
+  createSwipeInvoiceForOrder,
+  getSwipeInvoicePdf,
+} from "../services/swipeService.js";
 
 function order(overrides = {}) {
   return {
@@ -131,6 +134,30 @@ test("Swipe mapping and missing-bank responses are corrected before one invoice 
     assert.equal(requests[2].items[0].id, "TAQ-PRODUCT-ORDER-129");
     assert.equal(requests[3].payments, undefined);
     assert.match(requests[3].notes, /Paid via Razorpay/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.SWIPE_API_KEY;
+    else process.env.SWIPE_API_KEY = originalKey;
+  }
+});
+
+test("Swipe HTTP 200 JSON errors are never returned as PDF files", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.SWIPE_API_KEY;
+  process.env.SWIPE_API_KEY = "test-only-key";
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    success: false,
+    message: "You have reached your monthly API usage limit.",
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  try {
+    await assert.rejects(
+      () => getSwipeInvoicePdf("hash-1"),
+      (error) => error.statusCode === 502 && /monthly API usage limit/.test(error.message)
+    );
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.SWIPE_API_KEY;
