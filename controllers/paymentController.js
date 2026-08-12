@@ -525,6 +525,46 @@ export async function downloadCustomerInvoice(req, res) {
 }
 
 /**
+ * Normalize Razorpay payment.method for orders.payment_method.
+ * Never returns "razorpay" — use the instrument (upi, card, …).
+ * @param {unknown} method
+ * @returns {string|null}
+ */
+function normalizeRazorpayPaymentMethod(method) {
+  const raw = String(method || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+
+  if (!raw || raw === "razorpay") return null;
+
+  const map = {
+    upi: "upi",
+    card: "card",
+    netbanking: "netbanking",
+    wallet: "wallet",
+    emi: "emi",
+    paylater: "paylater",
+  };
+
+  if (map[raw]) return map[raw];
+
+  // Unknown but non-empty Razorpay method — store lowercase as-is
+  return String(method).trim().toLowerCase();
+}
+
+/**
+ * Fetch Razorpay payment and return normalized instrument method.
+ * @param {string} razorpay_payment_id
+ * @returns {Promise<string|null>}
+ */
+async function fetchRazorpayPaymentMethod(razorpay_payment_id) {
+  const razorpay = getRazorpayClient();
+  const rzPayment = await razorpay.payments.fetch(razorpay_payment_id);
+  return normalizeRazorpayPaymentMethod(rzPayment?.method);
+}
+
+/**
  * Confirm Razorpay order/payment amounts match the internal order (paise).
  * For test orders, expected amount is always 100 paise.
  */
@@ -1237,6 +1277,35 @@ export async function verifyPayment(req, res) {
       }
     }
 
+    // Persist actual Razorpay instrument into orders.payment_method (not "Razorpay")
+    let resolvedPaymentMethod = null;
+    try {
+      resolvedPaymentMethod = await fetchRazorpayPaymentMethod(
+        razorpay_payment_id
+      );
+    } catch (methodErr) {
+      console.error(
+        "Razorpay payment method fetch failed:",
+        maskId(razorpay_payment_id),
+        methodErr?.error?.description || methodErr?.message
+      );
+      return res.status(400).json({
+        success: false,
+        message: "Failed to fetch Razorpay payment method",
+      });
+    }
+
+    if (!resolvedPaymentMethod) {
+      console.warn(
+        "Razorpay payment missing method:",
+        maskId(razorpay_payment_id)
+      );
+      return res.status(400).json({
+        success: false,
+        message: "Razorpay payment method is missing",
+      });
+    }
+
     // Only transition Pending → Paid once (prevents double used_count increment)
     let rows;
     try {
@@ -1247,6 +1316,7 @@ export async function verifyPayment(req, res) {
            order_status = 'Confirmed',
            razorpay_payment_id = $1,
            razorpay_signature = $2,
+           payment_method = $4,
            payment_date = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
          WHERE razorpay_order_id = $3
@@ -1259,10 +1329,16 @@ export async function verifyPayment(req, res) {
            discount_amount,
            total_amount,
            payment_status,
+           payment_method,
            razorpay_order_id,
            razorpay_payment_id,
            COALESCE(is_test_order, FALSE) AS is_test_order`,
-        [razorpay_payment_id, razorpay_signature, razorpay_order_id]
+        [
+          razorpay_payment_id,
+          razorpay_signature,
+          razorpay_order_id,
+          resolvedPaymentMethod,
+        ]
       ));
     } catch (updErr) {
       if (
@@ -1276,6 +1352,7 @@ export async function verifyPayment(req, res) {
              order_status = 'Confirmed',
              razorpay_payment_id = $1,
              razorpay_signature = $2,
+             payment_method = $4,
              payment_date = CURRENT_TIMESTAMP,
              updated_at = CURRENT_TIMESTAMP
            WHERE razorpay_order_id = $3
@@ -1288,10 +1365,16 @@ export async function verifyPayment(req, res) {
              discount_amount,
              total_amount,
              payment_status,
+             payment_method,
              razorpay_order_id,
              razorpay_payment_id,
              FALSE AS is_test_order`,
-          [razorpay_payment_id, razorpay_signature, razorpay_order_id]
+          [
+            razorpay_payment_id,
+            razorpay_signature,
+            razorpay_order_id,
+            resolvedPaymentMethod,
+          ]
         ));
       } else {
         throw updErr;
@@ -1369,6 +1452,8 @@ export async function verifyPayment(req, res) {
         order.order_number,
         "rz_payment=",
         maskId(order.razorpay_payment_id),
+        "payment_method=",
+        order.payment_method,
         "→ database updated Paid"
       );
     }

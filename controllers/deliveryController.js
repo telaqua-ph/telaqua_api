@@ -252,14 +252,18 @@ function mapPaymentMode(paymentMethod) {
     return "COD";
   }
 
-  // Razorpay and other prepaid/online methods
+  // Razorpay instruments and other prepaid/online methods
   if (
     method === "razorpay" ||
     method === "prepaid" ||
     method === "pre-paid" ||
     method === "online" ||
     method === "upi" ||
-    method === "card"
+    method === "card" ||
+    method === "netbanking" ||
+    method === "wallet" ||
+    method === "emi" ||
+    method === "paylater"
   ) {
     return "Pre-paid";
   }

@@ -157,6 +157,24 @@ function buildSwipePayload(order) {
   const phone = normalizeIndianPhone(order.phone);
   const sendWtsp = consented && !phone.error && !order.is_test_order;
 
+  // orders.payment_method stores Razorpay instrument (upi/card/…).
+  // Swipe only accepts: cash, card, upi, netBanking, cheque, emi.
+  const rawMethod = String(order.payment_method || "")
+    .trim()
+    .toLowerCase();
+  const swipeMethodMap = {
+    upi: "upi",
+    card: "card",
+    netbanking: "netBanking",
+    emi: "emi",
+    cash: "cash",
+    cheque: "cheque",
+    wallet: "upi",
+    paylater: "emi",
+    razorpay: "upi",
+  };
+  const swipePaymentMethod = swipeMethodMap[rawMethod] || "upi";
+
   return {
     document_type: "invoice",
     document_date: formatDateDdMmYyyy(new Date()),
@@ -165,7 +183,7 @@ function buildSwipePayload(order) {
     payments: [
       {
         amount: round2(order.total_amount),
-        method: String(order.payment_method || "Razorpay").toLowerCase(),
+        method: swipePaymentMethod,
         notes: order.razorpay_payment_id || order.razorpay_order_id || "",
       },
     ],
