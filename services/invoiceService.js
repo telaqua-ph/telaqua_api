@@ -349,8 +349,8 @@ export async function refreshSwipeInvoiceHsn(orderId) {
 
   // Editing an existing invoice must not resend customer notifications or add a
   // second Razorpay payment entry.
-  payload.send_wtsp = false;
-  payload.send_sms = false;
+  delete payload.send_wtsp;
+  delete payload.send_sms;
   delete payload.payments;
 
   await updateSwipeInvoiceForOrder(order, order.swipe_invoice_id, payload);
