@@ -21,6 +21,7 @@ import dashboardRoutes from "./routes/dashboard.js";
 import deliveryRoutes from "./routes/delivery.js";
 import promoRoutes from "./routes/promo.js";
 import promoCodesRoutes from "./routes/promoCodes.js";
+import { handleSwipeWebhook } from "./controllers/swipeWebhookController.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const INVOICES_STATIC_DIR =
@@ -85,6 +86,11 @@ app.use(
       "X-Api-Version",
     ],
   })
+);
+app.post(
+  "/api/webhooks/swipe",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  handleSwipeWebhook
 );
 app.use(express.json({ limit: "1mb" }));
 

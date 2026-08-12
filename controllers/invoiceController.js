@@ -1,10 +1,13 @@
 /**
  * controllers/invoiceController.js
  *
- * Manual admin retry: generate invoice + send WhatsApp for paid orders.
+ * Manual admin retry + admin invoice PDF download.
  */
 
-import { processOrderFulfillment } from "../services/invoiceService.js";
+import {
+  getOrderInvoicePdfByOrderId,
+  processOrderFulfillment,
+} from "../services/invoiceService.js";
 
 function parseOrderId(raw) {
   const id = Number(raw);
@@ -32,6 +35,7 @@ export async function processOrderInvoice(req, res) {
         invoice_number: result.invoice.invoice_number,
         invoice_url: result.invoice.invoice_url,
         invoice_generated_at: result.invoice.invoice_generated_at,
+        swipe_invoice_id: result.invoice.swipe_invoice_id,
       },
       whatsapp: {
         status: result.whatsapp.status,
@@ -60,6 +64,40 @@ export async function processOrderInvoice(req, res) {
     return res.status(500).json({
       success: false,
       message: "Failed to process invoice",
+    });
+  }
+}
+
+/** GET /api/orders/:orderId/invoice/download */
+export async function downloadOrderInvoice(req, res) {
+  try {
+    const orderId = parseOrderId(req.params.orderId);
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid order id",
+      });
+    }
+
+    const pdf = await getOrderInvoicePdfByOrderId(orderId);
+
+    res.setHeader("Content-Type", pdf.contentType || "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename=\"order-${orderId}-invoice.pdf\"`);
+    return res.status(200).send(pdf.buffer);
+  } catch (error) {
+    console.error("Download order invoice error:", error?.message || error);
+    const status = error?.statusCode || 500;
+
+    if (status === 404) {
+      return res.status(404).json({
+        success: false,
+        message: error.message || "Invoice not found",
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to download invoice",
     });
   }
 }

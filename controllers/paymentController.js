@@ -19,7 +19,11 @@ import {
   ensureWhatsappConsentColumns,
   parseWhatsappConsent,
 } from "../services/whatsappConsent.js";
-import { processOrderFulfillment } from "../services/invoiceService.js";
+import {
+  getOrderInvoicePdfByOrderId,
+  loadOrderForFulfillment,
+  processOrderFulfillment,
+} from "../services/invoiceService.js";
 
 /** Default PH meter unit price when no promo is applied. */
 const PRODUCT_PRICE = 2499;
@@ -350,6 +354,174 @@ function triggerOrderFulfillmentAsync(orderId) {
       message: err?.message || String(err),
     });
   });
+}
+
+function parsePositiveOrderId(raw) {
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) {
+    return null;
+  }
+  return id;
+}
+
+function validateInvoiceStatusPayload(body) {
+  if (!body || typeof body !== "object") {
+    return { error: "Invalid JSON body" };
+  }
+
+  const order_id = parsePositiveOrderId(body.order_id);
+  const razorpay_payment_id = trimStr(body.razorpay_payment_id);
+
+  if (!order_id) {
+    return { error: "order_id must be a positive integer" };
+  }
+  if (!razorpay_payment_id) {
+    return { error: "razorpay_payment_id is required" };
+  }
+
+  return {
+    data: {
+      order_id,
+      razorpay_payment_id: String(razorpay_payment_id),
+    },
+  };
+}
+
+/** POST /api/payment/invoice-status */
+export async function getInvoiceStatus(req, res) {
+  try {
+    const validation = validateInvoiceStatusPayload(req.body);
+    if (validation.error) {
+      return res.status(400).json({
+        success: false,
+        message: validation.error,
+      });
+    }
+
+    const { order_id, razorpay_payment_id } = validation.data;
+    const order = await loadOrderForFulfillment(order_id);
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    if (String(order.razorpay_payment_id || "") !== razorpay_payment_id) {
+      return res.status(403).json({
+        success: false,
+        message: "Payment does not match this order",
+      });
+    }
+
+    if (String(order.payment_status || "").trim() !== "Paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Invoice is available only for paid orders",
+      });
+    }
+
+    if (
+      order.swipe_invoice_id ||
+      (order.invoice_number &&
+        String(order.invoice_status || "").trim() === "generated")
+    ) {
+      return res.status(200).json({
+        success: true,
+        invoice_ready: true,
+        invoice_number: order.invoice_number,
+        invoice_url: order.invoice_url,
+        invoice_generated_at: order.invoice_generated_at,
+      });
+    }
+
+    triggerOrderFulfillmentAsync(order.id);
+
+    return res.status(200).json({
+      success: true,
+      invoice_ready: false,
+      message: "Invoice is being generated",
+    });
+  } catch (error) {
+    console.error("Payment invoice-status error:", error?.message || error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+}
+
+/** GET /api/payment/invoice-download?order_id=&razorpay_payment_id= */
+export async function downloadCustomerInvoice(req, res) {
+  try {
+    const order_id = parsePositiveOrderId(req.query.order_id);
+    const razorpay_payment_id = trimStr(req.query.razorpay_payment_id);
+
+    if (!order_id) {
+      return res.status(400).json({
+        success: false,
+        message: "order_id must be a positive integer",
+      });
+    }
+    if (!razorpay_payment_id) {
+      return res.status(400).json({
+        success: false,
+        message: "razorpay_payment_id is required",
+      });
+    }
+
+    const order = await loadOrderForFulfillment(order_id);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+    if (String(order.razorpay_payment_id || "") !== razorpay_payment_id) {
+      return res.status(403).json({
+        success: false,
+        message: "Payment does not match this order",
+      });
+    }
+    if (String(order.payment_status || "").trim() !== "Paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Invoice is available only for paid orders",
+      });
+    }
+    if (!order.swipe_invoice_id) {
+      triggerOrderFulfillmentAsync(order.id);
+      return res.status(404).json({
+        success: false,
+        message: "Invoice is not generated yet",
+      });
+    }
+
+    const pdf = await getOrderInvoicePdfByOrderId(order.id);
+    const invoiceNumber =
+      order.invoice_number || `invoice-order-${String(order.id)}`;
+
+    res.setHeader("Content-Type", pdf.contentType || "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${invoiceNumber}.pdf"`
+    );
+    return res.status(200).send(pdf.buffer);
+  } catch (error) {
+    console.error("Payment invoice-download error:", error?.message || error);
+    const status = error?.statusCode || 500;
+    if (status === 404) {
+      return res.status(404).json({
+        success: false,
+        message: error.message || "Invoice not found",
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      message: "Failed to download invoice",
+    });
+  }
 }
 
 /**
