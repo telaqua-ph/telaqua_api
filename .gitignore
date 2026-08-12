@@ -31,3 +31,6 @@ Thumbs.db
 dist/
 coverage/
 *.tsbuildinfo
+
+# Generated customer invoice PDFs (keep directory via .gitkeep)
+public/invoices/*.pdf

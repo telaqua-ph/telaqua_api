@@ -5,6 +5,8 @@
  */
 
 import express from "express";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
@@ -19,6 +21,11 @@ import dashboardRoutes from "./routes/dashboard.js";
 import deliveryRoutes from "./routes/delivery.js";
 import promoRoutes from "./routes/promo.js";
 import promoCodesRoutes from "./routes/promoCodes.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const INVOICES_STATIC_DIR =
+  process.env.INVOICES_STORAGE_DIR?.trim() ||
+  path.join(__dirname, "public", "invoices");
 
 const app = express();
 
@@ -80,6 +87,19 @@ app.use(
   })
 );
 app.use(express.json({ limit: "1mb" }));
+
+// Public invoice PDFs (Interakt document header must fetch via HTTPS)
+app.use(
+  "/invoices",
+  express.static(INVOICES_STATIC_DIR, {
+    index: false,
+    dotfiles: "deny",
+    setHeaders(res) {
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+    },
+  })
+);
 
 // Health checks — must not depend on DB, Razorpay, or Delhivery
 app.get("/", (req, res) => {

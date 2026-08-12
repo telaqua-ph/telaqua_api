@@ -19,6 +19,7 @@ import {
   ensureWhatsappConsentColumns,
   parseWhatsappConsent,
 } from "../services/whatsappConsent.js";
+import { processOrderFulfillment } from "../services/invoiceService.js";
 
 /** Default PH meter unit price when no promo is applied. */
 const PRODUCT_PRICE = 2499;
@@ -338,6 +339,17 @@ function buildVerifySuccessResponse(order, message) {
     payment_status: order.payment_status || "Paid",
     is_test_order: isTest,
   };
+}
+
+/** Invoice + WhatsApp after Paid — non-blocking; never fails payment response. */
+function triggerOrderFulfillmentAsync(orderId) {
+  if (!orderId) return;
+  processOrderFulfillment(orderId).catch((err) => {
+    console.error("Order fulfillment failed:", {
+      orderId,
+      message: err?.message || String(err),
+    });
+  });
 }
 
 /**
@@ -949,6 +961,7 @@ export async function verifyPayment(req, res) {
           maskId(razorpay_payment_id)
         );
       }
+      triggerOrderFulfillmentAsync(paid.id);
       return res.status(200).json(
         buildVerifySuccessResponse(
           paid,
@@ -967,6 +980,7 @@ export async function verifyPayment(req, res) {
           orderRow.order_number
         );
       }
+      triggerOrderFulfillmentAsync(orderRow.id);
       return res.status(200).json(
         buildVerifySuccessResponse(
           {
@@ -1146,6 +1160,7 @@ export async function verifyPayment(req, res) {
       }
 
       if (again.rows.length && again.rows[0].payment_status === "Paid") {
+        triggerOrderFulfillmentAsync(again.rows[0].id);
         return res.status(200).json(
           buildVerifySuccessResponse(
             again.rows[0],
@@ -1185,6 +1200,8 @@ export async function verifyPayment(req, res) {
         "→ database updated Paid"
       );
     }
+
+    triggerOrderFulfillmentAsync(order.id);
 
     return res.status(200).json(buildVerifySuccessResponse(order));
   } catch (error) {
