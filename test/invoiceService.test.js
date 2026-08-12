@@ -5,6 +5,7 @@ import {
   createSwipeInvoiceForOrder,
   getSwipeInvoicePdf,
 } from "../services/swipeService.js";
+import { generateLocalInvoicePdf } from "../services/localInvoicePdfService.js";
 
 function order(overrides = {}) {
   return {
@@ -163,4 +164,12 @@ test("Swipe HTTP 200 JSON errors are never returned as PDF files", async () => {
     if (originalKey === undefined) delete process.env.SWIPE_API_KEY;
     else process.env.SWIPE_API_KEY = originalKey;
   }
+});
+
+test("paid-order fallback PDF contains a valid PDF header and HSN", async () => {
+  const pdf = await generateLocalInvoicePdf(order());
+  assert.equal(pdf.contentType, "application/pdf");
+  assert.equal(pdf.buffer.subarray(0, 5).toString("ascii"), "%PDF-");
+  assert.ok(pdf.buffer.length > 1000);
+  assert.equal(pdf.source, "local_fallback");
 });

@@ -125,8 +125,10 @@ Download with either the `X-Order-Token` header or this browser-friendly URL:
 ```
 
 The backend checks the token, Paid status, and Swipe hash, then downloads the PDF
-server-to-server. The Swipe key never reaches the browser. Avoid logging or sharing
-URLs containing the guest token.
+server-to-server. If Swipe PDF retrieval is unavailable (including an exhausted API
+allowance), the backend returns a PDF generated from the immutable paid-order
+snapshot. The Swipe key never reaches the browser. Avoid logging or sharing URLs
+containing the guest token.
 
 Admin users can retry and download with their normal Bearer JWT:
 

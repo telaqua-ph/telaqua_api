@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import { query } from "../config/db.js";
 import { normalizeIndianPhone } from "../utils/phoneUtils.js";
+import { generateLocalInvoicePdf } from "./localInvoicePdfService.js";
 import {
   createSwipeInvoiceForOrder,
   getSwipeInvoiceDetails,
@@ -291,6 +292,12 @@ export async function ensureSwipeInvoiceForPaidOrder(orderId) {
     await query(
       `UPDATE orders SET invoice_status = 'failed', swipe_invoice_error = $3,
          invoice_attempt_token = NULL, invoice_processing_started_at = NULL,
+         whatsapp_invoice_status = CASE
+           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, FALSE)
+             THEN 'failed' ELSE 'not_applicable' END,
+         whatsapp_invoice_error = CASE
+           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, FALSE)
+             THEN $3 ELSE NULL END,
          updated_at = CURRENT_TIMESTAMP
        WHERE id = $1 AND invoice_attempt_token = $2`,
       [order.id, attemptToken, safeError]
@@ -309,12 +316,22 @@ export async function getOrderInvoicePdfByOrderId(orderId) {
     error.statusCode = 404;
     throw error;
   }
-  if (String(order.payment_status).trim() !== "Paid" || !order.swipe_invoice_id) {
+  if (String(order.payment_status).trim() !== "Paid") {
     const error = new Error("Invoice is not available for this order yet");
     error.statusCode = 404;
     throw error;
   }
-  return getSwipeInvoicePdf(order.swipe_invoice_id);
+  if (order.swipe_invoice_id) {
+    try {
+      return await getSwipeInvoicePdf(order.swipe_invoice_id);
+    } catch (error) {
+      console.warn("[Invoice] Swipe PDF unavailable; using paid-order fallback", {
+        orderId: order.id,
+        message: error?.message || String(error),
+      });
+    }
+  }
+  return generateLocalInvoicePdf(order);
 }
 
 export async function refreshSwipeInvoiceHsn(orderId) {

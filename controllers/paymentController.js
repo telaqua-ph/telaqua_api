@@ -492,7 +492,7 @@ export async function getInvoiceStatus(req, res) {
         invoice_ready: true,
         invoice_number: order.invoice_number,
         invoice_url: buildCustomerInvoiceUrl(
-          order.id, invoice_access_token, razorpay_payment_id
+          req, order.id, invoice_access_token, razorpay_payment_id
         ),
         invoice_generated_at: order.invoice_generated_at,
       });
@@ -508,18 +508,35 @@ export async function getInvoiceStatus(req, res) {
           invoice_status: "generated",
           invoice_number: order.invoice_number,
           invoice_url: buildCustomerInvoiceUrl(
-            order.id, invoice_access_token, razorpay_payment_id
+            req, order.id, invoice_access_token, razorpay_payment_id
           ),
           invoice_generated_at: order.invoice_generated_at,
         });
       }
     } catch (error) {
       order = await loadOrderForFulfillment(order.id);
-      return res.status(502).json({
-        success: false,
-        invoice_ready: false,
-        invoice_status: "failed",
-        message: "Invoice generation failed. Please try again.",
+      return res.status(200).json({
+        success: true,
+        invoice_ready: true,
+        invoice_status: "fallback_generated",
+        invoice_number: order.invoice_number || order.order_number,
+        invoice_url: buildCustomerInvoiceUrl(
+          req, order.id, invoice_access_token, razorpay_payment_id
+        ),
+        message: "Swipe invoice is unavailable; a paid-order invoice copy is ready.",
+      });
+    }
+
+    if (hasSwipeQuotaFailure(order)) {
+      return res.status(200).json({
+        success: true,
+        invoice_ready: true,
+        invoice_status: "fallback_generated",
+        invoice_number: order.invoice_number || order.order_number,
+        invoice_url: buildCustomerInvoiceUrl(
+          req, order.id, invoice_access_token, razorpay_payment_id
+        ),
+        message: "A paid-order invoice copy is ready for download.",
       });
     }
 
@@ -538,11 +555,25 @@ export async function getInvoiceStatus(req, res) {
   }
 }
 
-function buildCustomerInvoiceUrl(orderId, invoiceAccessToken, razorpayPaymentId) {
+function requestOrigin(req) {
+  const configured = String(process.env.BACKEND_BASE_URL || "").trim().replace(/\/$/, "");
+  if (configured) return configured;
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0].trim();
+  const protocol = forwardedProto || req.protocol || "https";
+  return `${protocol}://${req.get("host")}`;
+}
+
+function buildCustomerInvoiceUrl(req, orderId, invoiceAccessToken, razorpayPaymentId) {
   const query = new URLSearchParams({ order_id: String(orderId) });
   if (invoiceAccessToken) query.set("invoice_access_token", invoiceAccessToken);
   else query.set("razorpay_payment_id", razorpayPaymentId);
-  return `/api/payment/invoice-download?${query.toString()}`;
+  return `${requestOrigin(req)}/api/payment/invoice-download?${query.toString()}`;
+}
+
+function hasSwipeQuotaFailure(order) {
+  return String(order?.invoice_status || "").toLowerCase() === "failed" &&
+    /monthly api usage limit/i.test(String(order?.swipe_invoice_error || ""));
 }
 
 /** GET /api/payment/invoice-download?order_id=&invoice_access_token= */
@@ -586,7 +617,7 @@ export async function downloadCustomerInvoice(req, res) {
         message: "Invoice is available only for paid orders",
       });
     }
-    if (!order.swipe_invoice_id) {
+    if (!order.swipe_invoice_id && !hasSwipeQuotaFailure(order)) {
       try {
         const invoice = await ensureSwipeInvoiceForPaidOrder(order.id);
         order = await loadOrderForFulfillment(order.id);
@@ -599,20 +630,7 @@ export async function downloadCustomerInvoice(req, res) {
           });
         }
       } catch {
-        return res.status(502).json({
-          success: false,
-          invoice_ready: false,
-          invoice_status: "failed",
-          message: "Invoice generation failed. Please try again.",
-        });
-      }
-      if (!order?.swipe_invoice_id) {
-        return res.status(202).json({
-          success: true,
-          invoice_ready: false,
-          invoice_status: String(order?.invoice_status || "pending").toLowerCase(),
-          message: "Invoice is being generated",
-        });
+        order = await loadOrderForFulfillment(order.id);
       }
     }
 
