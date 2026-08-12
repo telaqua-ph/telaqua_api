@@ -25,6 +25,11 @@ import {
   loadOrderForFulfillment,
   processOrderFulfillment,
 } from "../services/invoiceService.js";
+import {
+  authenticateCustomerRequest,
+  getBearerToken,
+  orderBelongsToCustomer,
+} from "../services/customerAuthService.js";
 
 /** Default PH meter unit price when no promo is applied. */
 const PRODUCT_PRICE = 2499;
@@ -584,6 +589,7 @@ export async function downloadCustomerInvoice(req, res) {
       req.headers["x-order-token"] || req.query.invoice_access_token
     );
     const razorpay_payment_id = trimStr(req.query.razorpay_payment_id);
+    let authenticatedCustomer = null;
 
     if (!order_id) {
       return res.status(400).json({
@@ -592,10 +598,20 @@ export async function downloadCustomerInvoice(req, res) {
       });
     }
     if (!invoice_access_token && !razorpay_payment_id) {
-      return res.status(400).json({
-        success: false,
-        message: "invoice_access_token or razorpay_payment_id is required",
-      });
+      if (!getBearerToken(req)) {
+        return res.status(401).json({
+          success: false,
+          message: "Customer authentication required",
+        });
+      }
+      try {
+        authenticatedCustomer = await authenticateCustomerRequest(req);
+      } catch (error) {
+        return res.status(error?.statusCode || 401).json({
+          success: false,
+          message: error?.message || "Unauthorized",
+        });
+      }
     }
 
     let order = await loadOrderForFulfillment(order_id);
@@ -605,7 +621,16 @@ export async function downloadCustomerInvoice(req, res) {
         message: "Order not found",
       });
     }
-    if (!hasCustomerInvoiceAccess(order, invoice_access_token, razorpay_payment_id)) {
+    if (
+      authenticatedCustomer &&
+      !orderBelongsToCustomer(order, authenticatedCustomer.phone)
+    ) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    if (
+      !authenticatedCustomer &&
+      !hasCustomerInvoiceAccess(order, invoice_access_token, razorpay_payment_id)
+    ) {
       return res.status(403).json({
         success: false,
         message: "You are not allowed to access this order",

@@ -90,6 +90,14 @@ npm run deploy
 | `POST` | `/api/orders` | Create order |
 | `GET` | `/api/customers` | List customers (admin) |
 | `GET` | `/api/customers/:id` | Get customer by ID |
+| `POST` | `/api/customer/auth/request-otp` | Send customer WhatsApp OTP |
+| `POST` | `/api/customer/auth/verify-otp` | Verify OTP and create customer session |
+| `POST` | `/api/customer/auth/logout` | Revoke customer session |
+| `GET` | `/api/customer/profile` | Authenticated customer profile |
+| `GET` | `/api/customer/orders` | Authenticated customer's order history |
+| `GET` | `/api/customer/orders/recent` | Authenticated customer's recent active order |
+| `GET` | `/api/customer/orders/:orderId` | Authenticated customer's owned order |
+| `GET` | `/api/customer/orders/:orderId/tracking` | Owned-order Delhivery tracking |
 | `GET` | `/api/dashboard/stats` | Dashboard metrics (admin) |
 
 > Handlers currently contain placeholders only. Business logic will be added next.

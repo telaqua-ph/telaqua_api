@@ -12,6 +12,7 @@
     "dev": "node --watch server.js",
     "start": "node server.js",
     "lint": "echo \"No linter configured yet\"",
+    "migrate:customer-auth": "node scripts/migrate-customer-auth.js",
     "test": "node --test --test-isolation=none"
   },
   "dependencies": {

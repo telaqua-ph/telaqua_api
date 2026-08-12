@@ -26,48 +26,28 @@ function maskPhone(phone) {
  * @param {string} params.pdfUrl - public HTTPS invoice URL
  * @param {string} params.fileName - e.g. INV-2026-000123.pdf
  */
-export async function sendOrderInvoiceWhatsApp({
+export async function sendInteraktTemplate({
   countryCode,
   phoneNumber,
-  customerName,
-  orderId,
-  amount,
-  pdfUrl,
-  fileName,
+  template,
+  callbackData,
 }) {
   const apiKey = (process.env.INTERAKT_API_KEY || "").trim();
   if (!apiKey) {
     throw new Error("INTERAKT_API_KEY is not configured");
   }
 
-  const amountStr = String(
-    typeof amount === "number" && Number.isFinite(amount)
-      ? Math.round(amount)
-      : amount ?? ""
-  );
-
   const payload = {
     countryCode,
     phoneNumber,
+    ...(callbackData ? { callbackData } : {}),
     type: "Template",
-    template: {
-      name: TEMPLATE_NAME,
-      languageCode: TEMPLATE_LANGUAGE,
-      headerValues: [pdfUrl],
-      fileName,
-      bodyValues: [
-        String(customerName || "Customer"),
-        String(orderId || ""),
-        amountStr,
-      ],
-    },
+    template,
   };
 
   console.log("Interakt request started:", {
-    template: TEMPLATE_NAME,
+    template: template?.name || "unknown",
     phone: maskPhone(phoneNumber),
-    orderId,
-    fileName,
   });
 
   const controller = new AbortController();
@@ -97,14 +77,14 @@ export async function sendOrderInvoiceWhatsApp({
       ok: response.ok,
     });
 
-    if (!response.ok) {
+    if (!response.ok || data?.success === false || data?.result === false) {
       const safeMessage =
         data?.message ||
         data?.error ||
         data?.detail ||
         `Interakt API error (${response.status})`;
       const err = new Error(safeMessage);
-      err.statusCode = response.status;
+      err.statusCode = response.ok ? 502 : response.status;
       err.interaktResponse = data;
       throw err;
     }
@@ -138,4 +118,36 @@ export async function sendOrderInvoiceWhatsApp({
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export async function sendOrderInvoiceWhatsApp({
+  countryCode,
+  phoneNumber,
+  customerName,
+  orderId,
+  amount,
+  pdfUrl,
+  fileName,
+}) {
+  const amountStr = String(
+    typeof amount === "number" && Number.isFinite(amount)
+      ? Math.round(amount)
+      : amount ?? ""
+  );
+  return sendInteraktTemplate({
+    countryCode,
+    phoneNumber,
+    callbackData: `invoice:${String(orderId || "")}`,
+    template: {
+      name: TEMPLATE_NAME,
+      languageCode: TEMPLATE_LANGUAGE,
+      headerValues: [pdfUrl],
+      fileName,
+      bodyValues: [
+        String(customerName || "Customer"),
+        String(orderId || ""),
+        amountStr,
+      ],
+    },
+  });
 }

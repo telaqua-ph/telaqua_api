@@ -17,6 +17,7 @@ import paymentRoutes from "./routes/payment.js";
 import testRazorpayRoutes from "./routes/testRazorpay.js";
 import contactRoutes from "./routes/contact.js";
 import customersRoutes from "./routes/customers.js";
+import customerAccountRoutes from "./routes/customerAccount.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import deliveryRoutes from "./routes/delivery.js";
 import promoRoutes from "./routes/promo.js";
@@ -30,6 +31,7 @@ const INVOICES_STATIC_DIR =
   path.join(__dirname, "public", "invoices");
 
 const app = express();
+app.set("trust proxy", 1);
 
 function buildCorsOrigin() {
   const frontendUrl = (process.env.FRONTEND_URL || "").trim();
@@ -139,6 +141,7 @@ app.use("/api/promo", promoRoutes);
 app.use("/api/promo-codes", promoCodesRoutes);
 app.use("/api/contact", contactRoutes);
 app.use("/api/customers", customersRoutes);
+app.use("/api/customer", customerAccountRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/delivery", deliveryRoutes);
 // Alias requested for TAT docs/Postman: /api/delhivery/...

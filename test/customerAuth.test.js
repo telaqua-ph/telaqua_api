@@ -1,0 +1,93 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  generateOtp,
+  hashOtp,
+  signCustomerToken,
+  verifyCustomerToken,
+  verifyOtpHash,
+} from "../lib/customerAuth.js";
+import { normalizeIndianPhone } from "../utils/phoneUtils.js";
+import { orderBelongsToCustomer } from "../services/customerAuthService.js";
+import { sendOtp } from "../services/interaktOtpService.js";
+
+const TEST_SECRET = "customer-auth-test-secret-at-least-32-characters";
+
+test("Indian phone formats normalize to one customer identity", () => {
+  for (const value of ["9876543210", "+91 98765 43210", "919876543210", "09876543210"]) {
+    assert.deepEqual(normalizeIndianPhone(value), {
+      countryCode: "+91",
+      phoneNumber: "9876543210",
+    });
+  }
+});
+
+test("OTP is six digits and only its keyed salted hash verifies", () => {
+  const originalSecret = process.env.CUSTOMER_AUTH_SECRET;
+  process.env.CUSTOMER_AUTH_SECRET = TEST_SECRET;
+  try {
+    const otp = generateOtp();
+    assert.match(otp, /^\d{6}$/);
+    const stored = hashOtp("9876543210", otp);
+    assert.doesNotMatch(stored, new RegExp(otp));
+    assert.equal(verifyOtpHash("9876543210", otp, stored), true);
+    assert.equal(verifyOtpHash("9876543210", "000000", stored), otp === "000000");
+    assert.equal(verifyOtpHash("9123456789", otp, stored), false);
+  } finally {
+    if (originalSecret === undefined) delete process.env.CUSTOMER_AUTH_SECRET;
+    else process.env.CUSTOMER_AUTH_SECRET = originalSecret;
+  }
+});
+
+test("customer JWT is typed, scoped and includes a revocable token id", () => {
+  const originalSecret = process.env.CUSTOMER_AUTH_SECRET;
+  process.env.CUSTOMER_AUTH_SECRET = TEST_SECRET;
+  try {
+    const token = signCustomerToken({
+      phone: "9876543210",
+      tokenId: "991b2ca4-c323-4a22-847e-b92f6081da62",
+    });
+    const payload = verifyCustomerToken(token);
+    assert.equal(payload.sub, "9876543210");
+    assert.equal(payload.phone, "9876543210");
+    assert.equal(payload.token_type, "customer");
+    assert.equal(payload.jti, "991b2ca4-c323-4a22-847e-b92f6081da62");
+  } finally {
+    if (originalSecret === undefined) delete process.env.CUSTOMER_AUTH_SECRET;
+    else process.env.CUSTOMER_AUTH_SECRET = originalSecret;
+  }
+});
+
+test("order ownership uses normalized phone and rejects another customer", () => {
+  assert.equal(orderBelongsToCustomer({ phone: "+91 9876543210" }, "9876543210"), true);
+  assert.equal(orderBelongsToCustomer({ phone: "9123456789" }, "9876543210"), false);
+});
+
+test("Interakt OTP request uses authentication body and button values", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.INTERAKT_API_KEY;
+  const originalTemplate = process.env.INTERAKT_OTP_TEMPLATE_NAME;
+  let captured;
+  process.env.INTERAKT_API_KEY = "test-interakt-key";
+  process.env.INTERAKT_OTP_TEMPLATE_NAME = "customer_login_auth";
+  globalThis.fetch = async (_url, options) => {
+    captured = JSON.parse(options.body);
+    return new Response(JSON.stringify({ id: "message-1" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  try {
+    const result = await sendOtp("9876543210", "123456");
+    assert.equal(result.messageId, "message-1");
+    assert.equal(captured.phoneNumber, "9876543210");
+    assert.deepEqual(captured.template.bodyValues, ["123456"]);
+    assert.deepEqual(captured.template.buttonValues, { "0": ["123456"] });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.INTERAKT_API_KEY;
+    else process.env.INTERAKT_API_KEY = originalKey;
+    if (originalTemplate === undefined) delete process.env.INTERAKT_OTP_TEMPLATE_NAME;
+    else process.env.INTERAKT_OTP_TEMPLATE_NAME = originalTemplate;
+  }
+});
