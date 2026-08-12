@@ -93,13 +93,41 @@ export async function createSwipeInvoiceForOrder(order, payload) {
     apiKeyLoaded: config.apiKeyLoaded,
   });
 
-  const response = await requestSwipe("/doc", {
+  let response = await requestSwipe("/doc", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 
-  const text = await response.text();
-  const data = parseJsonMaybe(text);
+  let responseText = await response.text();
+  let data = parseJsonMaybe(responseText);
+
+  // Some Swipe accounts reject invoice creation with "Bank details not found"
+  // when the optional payments array is supplied before a bank account is set up.
+  // The rejected request creates no document. Retry once without only that optional
+  // object so the paid website order still receives its invoice; reconciliation is
+  // retained in reference/notes and the invoice total is unchanged.
+  const bankDetailsMissing =
+    !response.ok &&
+    response.status === 400 &&
+    /bank details not found/i.test(String(data?.message || data?.error || "")) &&
+    Array.isArray(payload.payments);
+  if (bankDetailsMissing) {
+    console.warn("[Invoice] Swipe has no bank details; retrying document without payment record", {
+      orderId: order.id,
+    });
+    const fallbackPayload = { ...payload };
+    delete fallbackPayload.payments;
+    fallbackPayload.notes = [
+      payload.notes,
+      `Paid via Razorpay: ${order.razorpay_payment_id}`,
+    ].filter(Boolean).join("; ");
+    response = await requestSwipe("/doc", {
+      method: "POST",
+      body: JSON.stringify(fallbackPayload),
+    });
+    responseText = await response.text();
+    data = parseJsonMaybe(responseText);
+  }
 
   console.log("[Invoice] Swipe response received", {
     orderId: order.id,
