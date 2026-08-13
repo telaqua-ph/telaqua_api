@@ -210,6 +210,8 @@ function validateCreateTestPaymentOrder(body) {
     }
   }
 
+  const consent = parseWhatsappConsent(body);
+
   return {
     data: {
       customer_name,
@@ -220,6 +222,8 @@ function validateCreateTestPaymentOrder(body) {
       state: String(state),
       pincode: String(pincode),
       quantity: 1,
+      whatsapp_updates_consent: consent.whatsapp_updates_consent,
+      whatsapp_consent_at: consent.whatsapp_consent_at,
     },
   };
 }
@@ -1048,6 +1052,17 @@ export async function createTestPaymentOrder(req, res) {
       });
     }
 
+    try {
+      await ensureWhatsappConsentColumns();
+    } catch (colErr) {
+      console.error("TEST ORDER: WhatsApp consent columns ensure failed:", colErr?.message);
+      return res.status(500).json({
+        success: false,
+        message:
+          "Orders table is missing WhatsApp consent columns. Run sql/add_whatsapp_consent.sql",
+      });
+    }
+
     // Server-enforced pricing — ignore any client amount
     const unit_price = TEST_AMOUNT_RUPEES;
     const total_amount = TEST_AMOUNT_RUPEES;
@@ -1132,11 +1147,14 @@ export async function createTestPaymentOrder(req, res) {
           final_total,
           invoice_status,
           invoice_access_token_hash,
-          is_test_order
+          is_test_order,
+          whatsapp_updates_consent,
+          whatsapp_consent_at
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
           'Razorpay', 'Pending', 'New', $11, NULL, $12, 0,
-          $13, $14, $15, $16, $17, $18, 'not_created', $19, TRUE
+          $13, $14, $15, $16, $17, $18, 'not_created', $19, TRUE,
+          $20, $21
         )
         RETURNING id`,
         [
@@ -1159,6 +1177,8 @@ export async function createTestPaymentOrder(req, res) {
           testFinancial.shippingAmount,
           testFinancial.finalTotal,
           invoiceAccess.hash,
+          orderData.whatsapp_updates_consent,
+          orderData.whatsapp_consent_at,
         ]
       );
       inserted = result.rows;

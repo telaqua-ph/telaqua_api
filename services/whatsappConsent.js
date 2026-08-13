@@ -9,6 +9,13 @@ import { query } from "../config/db.js";
 
 let whatsappColumnsReady = false;
 
+const CONSENT_KEYS = [
+  "whatsapp_updates_consent",
+  "whatsappConsent",
+  "whatsapp_consent",
+  "receiveWhatsappUpdates",
+];
+
 /**
  * Ensure WhatsApp consent columns exist (idempotent).
  */
@@ -26,12 +33,55 @@ export async function ensureWhatsappConsentColumns() {
 }
 
 /**
+ * Resolve the first present consent field from the request body.
+ * @param {object} body
+ * @returns {unknown}
+ */
+function pickConsentRaw(body) {
+  for (const key of CONSENT_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) {
+      const value = body[key];
+      if (value !== undefined) {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Normalize common client truthy/falsy forms to a boolean or null (unknown).
+ * @param {unknown} raw
+ * @returns {boolean|null}
+ */
+function normalizeConsentValue(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (typeof raw === "boolean") {
+    return raw;
+  }
+  if (typeof raw === "number") {
+    if (raw === 1) return true;
+    if (raw === 0) return false;
+    return null;
+  }
+  if (typeof raw === "string") {
+    const s = raw.trim().toLowerCase();
+    if (s === "true" || s === "1" || s === "yes") return true;
+    if (s === "false" || s === "0" || s === "no" || s === "") return false;
+    return null;
+  }
+  return null;
+}
+
+/**
  * Validate and normalize whatsapp_updates_consent from a request body.
  * Missing/null → false (backward compatible with older clients).
- * Non-boolean when provided → error.
+ * Accepts boolean, common string/number forms, and alias keys.
  *
  * @param {object} body
- * @returns {{ error: string } | { whatsapp_updates_consent: boolean, whatsapp_consent_at: Date|null }}
+ * @returns {{ whatsapp_updates_consent: boolean, whatsapp_consent_at: Date|null }}
  */
 export function parseWhatsappConsent(body) {
   if (!body || typeof body !== "object") {
@@ -41,20 +91,10 @@ export function parseWhatsappConsent(body) {
     };
   }
 
-  const raw = body.whatsapp_updates_consent;
+  const raw = pickConsentRaw(body);
+  const normalized = normalizeConsentValue(raw);
 
-  if (raw === undefined || raw === null) {
-    return {
-      whatsapp_updates_consent: false,
-      whatsapp_consent_at: null,
-    };
-  }
-
-  if (typeof raw !== "boolean") {
-    return { error: "whatsapp_updates_consent must be a boolean" };
-  }
-
-  if (raw === true) {
+  if (normalized === true) {
     return {
       whatsapp_updates_consent: true,
       whatsapp_consent_at: new Date(),
