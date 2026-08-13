@@ -97,12 +97,26 @@ export async function getPromoOffer(req, res) {
 
 /**
  * POST /api/promo/validate
- * Body: { "code": "PONDFBT" }
+ * Body: { "code": "PONDFBT" } — also accepts promo_code / coupon_code aliases.
+ * Lookup is by code only (any platform/language). Does not increment used_count.
  */
 export async function validatePromoCode(req, res) {
   try {
     const body = req.body && typeof req.body === "object" ? req.body : {};
-    const code = normalizePromoCode(body.code);
+    // Prefer code; accept promo_code / coupon_code for create-order consistency
+    const rawCode =
+      body.code !== undefined && body.code !== null && body.code !== ""
+        ? body.code
+        : body.promo_code !== undefined &&
+            body.promo_code !== null &&
+            body.promo_code !== ""
+          ? body.promo_code
+          : body.coupon_code !== undefined &&
+              body.coupon_code !== null &&
+              body.coupon_code !== ""
+            ? body.coupon_code
+            : null;
+    const code = normalizePromoCode(rawCode);
 
     if (!code) {
       return res.status(400).json({
