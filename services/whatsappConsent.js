@@ -10,6 +10,7 @@ import { query } from "../config/db.js";
 let whatsappColumnsReady = false;
 
 const CONSENT_KEYS = [
+  "whatsapp_opt_in",
   "whatsapp_updates_consent",
   "whatsappConsent",
   "whatsapp_consent",
