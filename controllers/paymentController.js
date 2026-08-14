@@ -32,7 +32,7 @@ import {
 } from "../services/customerAuthService.js";
 
 /** Default PH meter unit price when no promo is applied. */
-const PRODUCT_PRICE = 2499;
+const PRODUCT_PRICE = 2999;
 
 /** Hidden LIVE test product — amount enforced only on the server (paise). */
 const TEST_PRODUCT_NAME = "Tel-Aqua Razorpay Live Test Product";
