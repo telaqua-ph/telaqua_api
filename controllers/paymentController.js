@@ -13,8 +13,12 @@ import {
   normalizePromoCode,
   findActivePromoByCode,
   mapPromoPricing,
-  incrementPromoUsedCount,
 } from "../services/promoService.js";
+import {
+  confirmCapturedRazorpayPayment,
+  logPaymentEvent,
+  triggerOrderFulfillmentAsync,
+} from "../services/confirmRazorpayPayment.js";
 import {
   ensureWhatsappConsentColumns,
   parseWhatsappConsent,
@@ -23,7 +27,6 @@ import {
   ensureSwipeInvoiceForPaidOrder,
   getOrderInvoicePdfByOrderId,
   loadOrderForFulfillment,
-  processOrderFulfillment,
 } from "../services/invoiceService.js";
 import {
   authenticateCustomerRequest,
@@ -410,17 +413,6 @@ function buildVerifySuccessResponse(order, message) {
     payment_status: order.payment_status || "Paid",
     is_test_order: isTest,
   };
-}
-
-/** Invoice + WhatsApp after Paid — non-blocking; never fails payment response. */
-function triggerOrderFulfillmentAsync(orderId) {
-  if (!orderId) return;
-  processOrderFulfillment(orderId).catch((err) => {
-    console.error("Order fulfillment failed:", {
-      orderId,
-      message: err?.message || String(err),
-    });
-  });
 }
 
 function parsePositiveOrderId(raw) {
@@ -973,6 +965,13 @@ export async function createPaymentOrder(req, res) {
       [razorpayOrder.id, dbOrderId]
     );
 
+    logPaymentEvent("PAYMENT_CREATED", {
+      orderId: dbOrderId,
+      orderNumber,
+      razorpayOrderId: razorpayOrder.id,
+      amountPaise: razorpayOrder.amount,
+    });
+
     return res.status(201).json({
       success: true,
       order_id: razorpayOrder.id,
@@ -1490,145 +1489,37 @@ export async function verifyPayment(req, res) {
       });
     }
 
-    // Only transition Pending → Paid once (prevents double used_count increment)
-    let rows;
-    try {
-      ({ rows } = await query(
-        `UPDATE orders
-         SET
-           payment_status = 'Paid',
-           order_status = 'Confirmed',
-           razorpay_payment_id = $1,
-           razorpay_signature = $2,
-           payment_method = $4,
-           payment_date = CURRENT_TIMESTAMP,
-           updated_at = CURRENT_TIMESTAMP
-         WHERE razorpay_order_id = $3
-           AND payment_status IN ('Pending', 'Failed')
-         RETURNING
-           id,
-           order_number,
-           promo_code,
-           original_amount,
-           discount_amount,
-           total_amount,
-           payment_status,
-           payment_method,
-           razorpay_order_id,
-           razorpay_payment_id,
-           COALESCE(is_test_order, FALSE) AS is_test_order`,
-        [
-          razorpay_payment_id,
-          razorpay_signature,
-          razorpay_order_id,
-          resolvedPaymentMethod,
-        ]
-      ));
-    } catch (updErr) {
-      if (
-        updErr?.code === "42703" ||
-        String(updErr?.message || "").includes("is_test_order")
-      ) {
-        ({ rows } = await query(
-          `UPDATE orders
-           SET
-             payment_status = 'Paid',
-             order_status = 'Confirmed',
-             razorpay_payment_id = $1,
-             razorpay_signature = $2,
-             payment_method = $4,
-             payment_date = CURRENT_TIMESTAMP,
-             updated_at = CURRENT_TIMESTAMP
-           WHERE razorpay_order_id = $3
-             AND payment_status IN ('Pending', 'Failed')
-           RETURNING
-             id,
-             order_number,
-             promo_code,
-             original_amount,
-             discount_amount,
-             total_amount,
-             payment_status,
-             payment_method,
-             razorpay_order_id,
-             razorpay_payment_id,
-             FALSE AS is_test_order`,
-          [
-            razorpay_payment_id,
-            razorpay_signature,
-            razorpay_order_id,
-            resolvedPaymentMethod,
-          ]
-        ));
-      } else {
-        throw updErr;
-      }
+    const result = await confirmCapturedRazorpayPayment({
+      razorpayOrderId: razorpay_order_id,
+      razorpayPaymentId: razorpay_payment_id,
+      razorpaySignature: razorpay_signature,
+      paymentMethod: resolvedPaymentMethod,
+      capturedAmount: amountCheck.payment?.amount,
+      capturedCurrency: amountCheck.payment?.currency,
+    });
+
+    if (result.status === "not_found") {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
     }
 
-    if (rows.length === 0) {
-      // Race: another request marked Paid
-      let again;
-      try {
-        again = await query(
-          `SELECT
-             id,
-             order_number,
-             payment_status,
-             razorpay_order_id,
-             razorpay_payment_id,
-             COALESCE(is_test_order, FALSE) AS is_test_order
-           FROM orders
-           WHERE razorpay_order_id = $1
-           LIMIT 1`,
-          [razorpay_order_id]
-        );
-      } catch {
-        again = await query(
-          `SELECT
-             id,
-             order_number,
-             payment_status,
-             razorpay_order_id,
-             razorpay_payment_id,
-             FALSE AS is_test_order
-           FROM orders
-           WHERE razorpay_order_id = $1
-           LIMIT 1`,
-          [razorpay_order_id]
-        );
-      }
+    if (result.status === "amount_mismatch") {
+      return res.status(409).json({
+        success: false,
+        message: "We could not verify this payment yet. Please check your order status.",
+      });
+    }
 
-      if (again.rows.length && again.rows[0].payment_status === "Paid") {
-        triggerOrderFulfillmentAsync(again.rows[0].id);
-        return res.status(200).json(
-          buildVerifySuccessResponse(
-            again.rows[0],
-            again.rows[0].is_test_order
-              ? "₹1 test payment already verified"
-              : "Payment verified successfully."
-          )
-        );
-      }
-
+    if (result.status === "ineligible" || !result.order) {
       return res.status(400).json({
         success: false,
         message: "Order is not eligible for payment verification",
       });
     }
 
-    const order = rows[0];
-
-    // Increment promo usage only after successful verification (once); never for test orders
-    if (order.promo_code && !order.is_test_order) {
-      const incremented = await incrementPromoUsedCount(order.promo_code);
-      if (!incremented) {
-        console.warn(
-          "Promo used_count was not incremented (inactive/limit/missing):",
-          order.promo_code
-        );
-      }
-    }
-
+    const order = result.order;
     if (order.is_test_order) {
       console.log(
         "TEST ORDER: payment verification successful",
@@ -1644,7 +1535,16 @@ export async function verifyPayment(req, res) {
 
     triggerOrderFulfillmentAsync(order.id);
 
-    return res.status(200).json(buildVerifySuccessResponse(order));
+    return res.status(200).json(
+      buildVerifySuccessResponse(
+        order,
+        result.status === "already_paid"
+          ? (order.is_test_order
+            ? "₹1 test payment already verified"
+            : "Payment already verified.")
+          : undefined
+      )
+    );
   } catch (error) {
     console.error("Payment verify-payment error:", error?.message || error);
 

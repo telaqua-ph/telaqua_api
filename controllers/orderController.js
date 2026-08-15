@@ -10,6 +10,7 @@ import {
   ensureWhatsappConsentColumns,
   parseWhatsappConsent,
 } from "../services/whatsappConsent.js";
+import { logPaymentEvent, reconcileRazorpayOrder } from "../services/confirmRazorpayPayment.js";
 
 const ALLOWED_ORDER_STATUSES = [
   "New",
@@ -137,10 +138,134 @@ export async function listOrders(req, res) {
       orders: rows,
     });
   } catch (error) {
+    logPaymentEvent("ADMIN_ORDER_FETCH_FAILED", {
+      message: error?.message,
+      code: error?.code,
+    });
     console.error("Orders API error:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
+    });
+  }
+}
+
+/**
+ * POST /api/orders/reconcile-razorpay
+ * Admin: confirm an existing Neon order from Razorpay if payment is captured.
+ */
+export async function reconcileRazorpayPayment(req, res) {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const razorpay_order_id = String(body.razorpay_order_id || "").trim();
+    const order_id = Number(body.order_id);
+    if (!razorpay_order_id && (!Number.isInteger(order_id) || order_id <= 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "Provide razorpay_order_id or order_id",
+      });
+    }
+
+    const result = await reconcileRazorpayOrder({
+      razorpayOrderId: razorpay_order_id || undefined,
+      orderId: Number.isInteger(order_id) && order_id > 0 ? order_id : undefined,
+    });
+
+    if (result.status === "not_found") {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found in Neon for this Razorpay order",
+        status: result.status,
+      });
+    }
+    if (result.status === "not_captured") {
+      return res.status(409).json({
+        success: false,
+        message: result.message || "Razorpay payment is not captured",
+        status: result.status,
+      });
+    }
+    if (result.status === "amount_mismatch") {
+      return res.status(409).json({
+        success: false,
+        message: "Razorpay amount does not match the Neon order",
+        status: result.status,
+      });
+    }
+    if (result.status === "ineligible") {
+      return res.status(400).json({
+        success: false,
+        message: result.message || "Order is not eligible for reconciliation",
+        status: result.status,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      status: result.status,
+      order_id: result.order?.id,
+      order_number: result.order?.order_number,
+      payment_status: result.order?.payment_status || "Paid",
+      razorpay_order_id: result.order?.razorpay_order_id,
+      razorpay_payment_id: result.order?.razorpay_payment_id,
+    });
+  } catch (error) {
+    logPaymentEvent("WEBHOOK_PROCESSING_FAILED", {
+      reason: "reconcile",
+      message: error?.message,
+    });
+    return res.status(500).json({
+      success: false,
+      message: "Reconciliation failed",
+    });
+  }
+}
+
+/**
+ * POST /api/orders/reconcile-pending-razorpay
+ * Admin: check recent Pending orders against Razorpay and confirm captured ones.
+ */
+export async function reconcilePendingRazorpayPayments(req, res) {
+  try {
+    const minutes = Math.min(Math.max(Number(req.body?.older_than_minutes) || 5, 1), 1440);
+    const { rows } = await query(
+      `SELECT id, order_number, razorpay_order_id, payment_status
+       FROM orders
+       WHERE payment_status IN ('Pending', 'Failed')
+         AND razorpay_order_id IS NOT NULL
+         AND created_at <= NOW() - ($1 * INTERVAL '1 minute')
+       ORDER BY created_at ASC
+       LIMIT 50`,
+      [minutes]
+    );
+
+    const results = [];
+    for (const row of rows) {
+      const result = await reconcileRazorpayOrder({
+        razorpayOrderId: row.razorpay_order_id,
+        orderId: row.id,
+      });
+      results.push({
+        order_id: row.id,
+        order_number: row.order_number,
+        razorpay_order_id: row.razorpay_order_id,
+        status: result.status,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      scanned: rows.length,
+      results,
+    });
+  } catch (error) {
+    logPaymentEvent("WEBHOOK_PROCESSING_FAILED", {
+      reason: "reconcile_pending",
+      message: error?.message,
+    });
+    return res.status(500).json({
+      success: false,
+      message: "Pending reconciliation failed",
     });
   }
 }

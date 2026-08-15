@@ -9,6 +9,8 @@ import {
   getOrderById,
   updateOrder,
   deleteOrder,
+  reconcileRazorpayPayment,
+  reconcilePendingRazorpayPayments,
 } from "../controllers/orderController.js";
 import {
   downloadOrderInvoice,
@@ -21,6 +23,8 @@ const router = Router();
 
 router.get("/", requireAuth, listOrders);
 router.post("/", createOrder);
+router.post("/reconcile-razorpay", requireAuth, reconcileRazorpayPayment);
+router.post("/reconcile-pending-razorpay", requireAuth, reconcilePendingRazorpayPayments);
 router.post("/:orderId/invoice", requireAuth, processOrderInvoice);
 router.post("/:orderId/retry-invoice", requireAuth, processOrderInvoice);
 router.post("/:orderId/invoice/refresh-hsn", requireAuth, refreshOrderInvoiceHsn);
