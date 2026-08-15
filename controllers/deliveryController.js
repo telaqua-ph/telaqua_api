@@ -97,6 +97,21 @@ function handleDelhiveryError(res, error, contextLabel) {
     });
   }
 
+  if (error?.code === "DELHIVERY_TIMEOUT") {
+    return res.status(504).json({
+      success: false,
+      message: "Delhivery request timed out. Please try again.",
+    });
+  }
+
+  if (error?.code === "ORDERS_COLUMN_MISSING" || error?.code === "AWB_SAVE_FAILED") {
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Cannot save AWB on the existing orders row",
+      ...(error.awb ? { awb: error.awb, waybill: error.awb } : {}),
+    });
+  }
+
   if (error?.code === "DELHIVERY_NETWORK_ERROR") {
     return res.status(502).json({
       success: false,
@@ -123,7 +138,7 @@ function handleDelhiveryError(res, error, contextLabel) {
     if (status === 401) {
       return res.status(401).json({
         success: false,
-        message: "Delhivery authentication failed",
+        message: upstreamMessage || "Delhivery authentication failed",
       });
     }
 
@@ -192,13 +207,13 @@ function handleDelhiveryError(res, error, contextLabel) {
     if (status >= 500) {
       return res.status(502).json({
         success: false,
-        message: "Delhivery service is currently unavailable",
+        message: upstreamMessage || "Delhivery service is currently unavailable",
       });
     }
 
     return res.status(502).json({
       success: false,
-      message: "Unable to complete Delhivery request",
+      message: upstreamMessage || "Unable to complete Delhivery request",
     });
   }
 
@@ -329,8 +344,13 @@ function getShipmentConfig() {
  * @param {object} config
  * @param {"COD"|"Pre-paid"} paymentMode
  */
+function orderChargeAmount(order) {
+  const n = Number(order.final_total ?? order.total_amount);
+  return n;
+}
+
 function buildShipmentPayload(order, config, paymentMode) {
-  const totalAmount = Number(order.total_amount);
+  const totalAmount = orderChargeAmount(order);
   const quantity = Number(order.quantity);
 
   const shipment = {
@@ -380,9 +400,92 @@ function buildShipmentPayload(order, config, paymentMode) {
 }
 
 /**
- * Interpret Delhivery CMU create.json soft-failure responses (HTTP 200).
+ * True if a value looks like a Delhivery AWB (numeric, 8–20 digits).
+ * Rejects batch ids / remarks accidentally stored as waybill.
+ * @param {*} value
+ * @returns {boolean}
+ */
+function looksLikeAwb(value) {
+  const s = String(value ?? "").trim();
+  return /^\d{8,20}$/.test(s);
+}
+
+/**
+ * Extract AWB from Delhivery create-shipment response shapes:
+ * packages[].waybill | waybill | wbn | awb
+ * Does not use upload_wbn (batch id).
+ * @param {object|null} data
+ * @returns {string|null}
+ */
+function extractAwbFromDelhiveryResponse(data) {
+  if (!data || typeof data !== "object") return null;
+  const firstPkg = Array.isArray(data.packages) ? data.packages[0] : null;
+  const candidates = [
+    firstPkg?.waybill,
+    firstPkg?.wbn,
+    firstPkg?.awb,
+    firstPkg?.AWB,
+    data.waybill,
+    data.wbn,
+    data.awb,
+    data.AWB,
+    data.shipment?.waybill,
+    data.shipment?.wbn,
+  ];
+  for (const c of candidates) {
+    const s = String(c ?? "").trim();
+    if (looksLikeAwb(s)) return s;
+  }
+  return null;
+}
+
+/**
+ * AWB already stored on the existing orders row.
+ * @param {object} order
+ * @returns {string|null}
+ */
+function existingOrderAwb(order) {
+  const candidates = [order?.waybill, order?.awb, order?.AWB];
+  for (const c of candidates) {
+    const s = String(c ?? "").trim();
+    if (looksLikeAwb(s)) return s;
+  }
+  return null;
+}
+
+/**
+ * Safe (no secrets) snapshot of a Delhivery body for logs.
+ * @param {*} data
+ * @returns {object}
+ */
+function safeDelhiveryResponseSnapshot(data) {
+  if (!data || typeof data !== "object") {
+    return { type: typeof data };
+  }
+  const first = Array.isArray(data.packages) ? data.packages[0] : null;
+  return {
+    keys: Object.keys(data).slice(0, 20),
+    package_count: data.package_count,
+    success: data.success,
+    rmk: data.rmk,
+    message: data.message,
+    waybill: data.waybill || null,
+    wbn: data.wbn || null,
+    upload_wbn: data.upload_wbn || null,
+    packages_len: Array.isArray(data.packages) ? data.packages.length : 0,
+    first_package_keys: first && typeof first === "object" ? Object.keys(first) : [],
+    first_package_status: first?.status || null,
+    first_package_waybill: first?.waybill || null,
+    first_package_remarks: first?.remarks || first?.remark || null,
+  };
+}
+
+/**
+ * Interpret Delhivery CMU create.json responses (including HTTP 200 soft-failures).
+ * Success requires a usable AWB. Never treat HTTP 200 alone as created.
+ *
  * @param {any} data
- * @returns {{ ok: true } | { ok: false, status: number, message: string }}
+ * @returns {{ ok: true, waybill: string, shipmentId: string|null } | { ok: false, status: number, message: string, waybill: null, shipmentId: string|null }}
  */
 function interpretShipmentCreateResult(data) {
   if (!data || typeof data !== "object") {
@@ -390,66 +493,147 @@ function interpretShipmentCreateResult(data) {
       ok: false,
       status: 502,
       message: "Delhivery returned an invalid or unexpected response",
+      waybill: null,
+      shipmentId: null,
     };
   }
 
-  const packageRemarks = Array.isArray(data.packages)
-    ? data.packages
-        .map((pkg) => pkg?.remarks || pkg?.remark || pkg?.status)
-        .filter(Boolean)
-        .join("; ")
-    : "";
-
+  const packages = Array.isArray(data.packages) ? data.packages : [];
+  const first = packages[0] || {};
+  const waybill = extractAwbFromDelhiveryResponse(data);
+  const shipmentId =
+    String(data.upload_wbn || data.shipment_id || "").trim() || null;
+  const packageRemarks = packages
+    .map((pkg) => pkg?.remarks || pkg?.remark || pkg?.status)
+    .filter(Boolean)
+    .join("; ");
   const combined = `${data.rmk || ""} ${packageRemarks} ${
     typeof data.error === "string" ? data.error : ""
   }`.toLowerCase();
-
   const looksDuplicate =
     combined.includes("duplicate") ||
     combined.includes("already exists") ||
     combined.includes("already exist");
+  const pkgStatus = String(first.status || "").toLowerCase();
+  const failedPkg = packages.find((pkg) => {
+    const status = String(pkg?.status || "").toLowerCase();
+    const remarks = String(pkg?.remarks || pkg?.remark || "").toLowerCase();
+    return (
+      status === "fail" ||
+      status === "failed" ||
+      remarks.includes("fail")
+    );
+  });
+  const successFlag =
+    data.success === true ||
+    data.success === "true" ||
+    pkgStatus === "success" ||
+    pkgStatus === "ok";
 
-  if (data.success === false || data.error === true) {
+  if (waybill) {
+    return { ok: true, waybill, shipmentId };
+  }
+
+  if (data.success === false || data.error === true || failedPkg) {
     const message =
+      (failedPkg && (failedPkg.remarks || failedPkg.remark)) ||
       packageRemarks ||
       (typeof data.rmk === "string" && data.rmk) ||
+      (typeof data.message === "string" && data.message) ||
       "Unable to create Delhivery shipment";
-
     return {
       ok: false,
       status: looksDuplicate ? 409 : 400,
       message,
+      waybill: null,
+      shipmentId,
     };
   }
 
-  if (Array.isArray(data.packages)) {
-    const failed = data.packages.find((pkg) => {
-      const status = String(pkg?.status || "").toLowerCase();
-      const remarks = String(pkg?.remarks || pkg?.remark || "").toLowerCase();
-      return (
-        status === "fail" ||
-        status === "failed" ||
-        remarks.includes("fail") ||
-        remarks.includes("duplicate")
-      );
-    });
-
-    if (failed) {
-      const message =
-        failed.remarks ||
-        failed.remark ||
-        "Unable to create Delhivery shipment";
-      const msg = String(message).toLowerCase();
-      return {
-        ok: false,
-        status:
-          msg.includes("duplicate") || msg.includes("already") ? 409 : 400,
-        message,
-      };
-    }
+  if (successFlag) {
+    return {
+      ok: false,
+      status: 502,
+      message: "Delhivery shipment succeeded but no AWB was returned.",
+      waybill: null,
+      shipmentId,
+    };
   }
 
-  return { ok: true };
+  return {
+    ok: false,
+    status: 502,
+    message:
+      packageRemarks ||
+      (typeof data.rmk === "string" && data.rmk) ||
+      "Delhivery did not return a waybill.",
+    waybill: null,
+    shipmentId,
+  };
+}
+
+/**
+ * Persist AWB on the SAME existing orders row. Never inserts a new order.
+ * Does not change order_status (shipment created ≠ shipped).
+ * @param {number} orderId
+ * @param {{ awb: string, shipmentId?: string|null }} payload
+ * @returns {Promise<object>}
+ */
+async function persistAwbOnOrder(orderId, { awb, shipmentId }) {
+  let updated;
+  try {
+    updated = await query(
+      `UPDATE orders SET
+         waybill = $2,
+         shipment_status = 'Created',
+         delhivery_shipment_id = COALESCE($3, delhivery_shipment_id),
+         shipment_created_at = COALESCE(shipment_created_at, CURRENT_TIMESTAMP),
+         shipment_error = NULL,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING id, waybill, shipment_status, delhivery_shipment_id, shipment_created_at`,
+      [orderId, awb, shipmentId || null]
+    );
+  } catch (err) {
+    if (err?.code === "42703") {
+      const missing = new Error(
+        `Cannot save AWB: a required orders column is missing (${err.message}).`
+      );
+      missing.code = "ORDERS_COLUMN_MISSING";
+      throw missing;
+    }
+    throw err;
+  }
+
+  try {
+    await query(
+      `UPDATE orders SET delivery_provider = 'Delhivery' WHERE id = $1`,
+      [orderId]
+    );
+  } catch (err) {
+    if (err?.code !== "42703") throw err;
+  }
+
+  return updated.rows[0];
+}
+
+/**
+ * Best-effort shipment_error on the same orders row. Never masks the real API error.
+ * @param {number} orderId
+ * @param {string} message
+ */
+async function recordShipmentError(orderId, message) {
+  try {
+    await query(
+      `UPDATE orders SET
+         shipment_error = $2,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [orderId, String(message || "").slice(0, 1000)]
+    );
+  } catch {
+    /* ignore missing column / db error */
+  }
 }
 
 /**
@@ -798,17 +982,20 @@ export async function createWarehouse(req, res) {
 /**
  * POST /api/delhivery/shipment/create
  * Also available under /api/delivery/shipment/create
+ * Optional alias: POST /api/delhivery/create-shipment
  *
  * Creates a Delhivery shipment for an existing Telaqua order.
- * Reads order from DB — does NOT modify the orders table.
+ * Loads the SAME orders row from Neon, then saves AWB onto that row.
+ * Does not change order_status (Created ≠ Shipped).
  */
 export async function createShipmentForOrder(req, res) {
   try {
     const body = req.body && typeof req.body === "object" ? req.body : {};
+    const rawOrderId = body.order_id ?? body.orderId;
     const hasOrderId =
-      body.order_id !== undefined &&
-      body.order_id !== null &&
-      String(body.order_id).trim() !== "";
+      rawOrderId !== undefined &&
+      rawOrderId !== null &&
+      String(rawOrderId).trim() !== "";
     const hasOrderNumber =
       body.order_number !== undefined &&
       body.order_number !== null &&
@@ -824,7 +1011,7 @@ export async function createShipmentForOrder(req, res) {
     let order = null;
 
     if (hasOrderId) {
-      const orderId = Number(body.order_id);
+      const orderId = Number(rawOrderId);
       if (!Number.isInteger(orderId) || orderId <= 0) {
         return res.status(400).json({
           success: false,
@@ -852,109 +1039,90 @@ export async function createShipmentForOrder(req, res) {
       });
     }
 
-    // Required order fields for shipment
-    if (!order.customer_name || !String(order.customer_name).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Order is missing customer_name",
+    const alreadyAwb = existingOrderAwb(order);
+    if (alreadyAwb) {
+      return res.status(200).json({
+        success: true,
+        message: "Shipment already created",
+        awb: alreadyAwb,
+        waybill: alreadyAwb,
+        order_id: order.id,
+        order_number: order.order_number,
+        shipment_status: order.shipment_status || "Created",
       });
+    }
+
+    const fail = async (status, message) => {
+      await recordShipmentError(order.id, message);
+      return res.status(status).json({
+        success: false,
+        message,
+        order_id: order.id,
+        order_number: order.order_number,
+      });
+    };
+
+    if (!order.customer_name || !String(order.customer_name).trim()) {
+      return fail(400, "Order is missing customer_name");
     }
     if (!order.phone || !String(order.phone).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Order is missing phone",
-      });
+      return fail(400, "Order is missing phone");
     }
     if (!order.address || !String(order.address).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Order is missing address",
-      });
+      return fail(400, "Order is missing address");
     }
     if (!order.city || !String(order.city).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Order is missing city",
-      });
+      return fail(400, "Order is missing city");
     }
     if (!order.state || !String(order.state).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Order is missing state",
-      });
+      return fail(400, "Order is missing state");
     }
     if (!order.pincode || !/^\d{6}$/.test(String(order.pincode).trim())) {
-      return res.status(400).json({
-        success: false,
-        message: "Order pincode must be a valid 6-digit Indian pincode",
-      });
+      return fail(400, "Order pincode must be a valid 6-digit Indian pincode");
     }
     if (
       order.quantity === undefined ||
       order.quantity === null ||
       Number(order.quantity) <= 0
     ) {
-      return res.status(400).json({
-        success: false,
-        message: "Order quantity must be greater than 0",
-      });
+      return fail(400, "Order quantity must be greater than 0");
     }
-    if (
-      order.total_amount === undefined ||
-      order.total_amount === null ||
-      Number(order.total_amount) <= 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Order total_amount must be greater than 0",
-      });
+    const amount = orderChargeAmount(order);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return fail(400, "Order amount must be a valid number greater than 0");
     }
     if (!order.payment_method || !String(order.payment_method).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Order is missing payment_method",
-      });
+      return fail(400, "Order is missing payment_method");
     }
     if (!order.order_number || !String(order.order_number).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Order is missing order_number",
-      });
+      return fail(400, "Order is missing order_number");
     }
 
     if (String(order.order_status || "").trim() === "Cancelled") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot create shipment for a cancelled order",
-      });
+      return fail(400, "Cannot create shipment for a cancelled order");
     }
 
     const paymentMode = mapPaymentMode(order.payment_method);
     if (!paymentMode) {
-      return res.status(400).json({
-        success: false,
-        message: `Unsupported payment_method for Delhivery: ${order.payment_method}`,
-      });
+      return fail(
+        400,
+        `Unsupported payment_method for Delhivery: ${order.payment_method}`
+      );
     }
 
-    // Prepaid (Razorpay) shipments should be paid; COD can ship without Paid
     if (
       paymentMode === "Pre-paid" &&
       String(order.payment_status || "").trim() !== "Paid"
     ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Prepaid/Razorpay orders must have payment_status Paid before shipment creation",
-      });
+      return fail(
+        400,
+        "Prepaid/Razorpay orders must have payment_status Paid before shipment creation"
+      );
     }
 
     const configResult = getShipmentConfig();
     if (!configResult.ok) {
-      return res.status(500).json({
-        success: false,
-        message: configResult.message,
-      });
+      return fail(500, configResult.message);
     }
 
     const payload = buildShipmentPayload(
@@ -963,14 +1131,28 @@ export async function createShipmentForOrder(req, res) {
       paymentMode
     );
 
-    // Limitation: orders table has no AWB/waybill column, so local duplicate
-    // detection is not possible. Delhivery enforces unique order IDs when
-    // auto-assigning waybills — surface those as 409 when returned.
+    console.log("Delhivery shipment create request:", {
+      order_id: order.id,
+      order_number: order.order_number,
+      pin: payload.shipments?.[0]?.pin,
+      city: payload.shipments?.[0]?.city,
+      state: payload.shipments?.[0]?.state,
+      quantity: payload.shipments?.[0]?.quantity,
+      payment_mode: payload.shipments?.[0]?.payment_mode,
+      warehouse: payload.pickup_location?.name,
+      weight: payload.shipments?.[0]?.weight,
+    });
 
     const data = await createShipment(payload);
     const interpreted = interpretShipmentCreateResult(data);
 
     if (!interpreted.ok) {
+      console.error("Delhivery shipment create failed:", {
+        order_id: order.id,
+        message: interpreted.message,
+        response: safeDelhiveryResponseSnapshot(data),
+      });
+      await recordShipmentError(order.id, interpreted.message);
       return res.status(interpreted.status).json({
         success: false,
         message: interpreted.message,
@@ -980,12 +1162,36 @@ export async function createShipmentForOrder(req, res) {
       });
     }
 
+    const saved = await persistAwbOnOrder(order.id, {
+      awb: interpreted.waybill,
+      shipmentId: interpreted.shipmentId,
+    }).catch((persistErr) => {
+      console.error("Failed to save AWB on orders row:", {
+        order_id: order.id,
+        awb: interpreted.waybill,
+        code: persistErr?.code,
+        message: persistErr?.message,
+      });
+      const wrap = new Error(
+        `Delhivery created AWB ${interpreted.waybill} but it could not be saved on the order. Do not click Send to Delhivery again.`
+      );
+      wrap.code = persistErr?.code || "AWB_SAVE_FAILED";
+      wrap.status = 500;
+      wrap.awb = interpreted.waybill;
+      throw wrap;
+    });
+
     return res.status(200).json({
       success: true,
       message: "Shipment created successfully",
+      awb: saved?.waybill || interpreted.waybill,
+      waybill: saved?.waybill || interpreted.waybill,
       order_id: order.id,
       order_number: order.order_number,
-      data,
+      shipment_status: saved?.shipment_status || "Created",
+      delhivery_shipment_id:
+        saved?.delhivery_shipment_id || interpreted.shipmentId,
+      shipment_created_at: saved?.shipment_created_at,
     });
   } catch (error) {
     return handleDelhiveryError(res, error, "Delivery shipment create");

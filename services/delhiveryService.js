@@ -340,8 +340,6 @@ function logDelhiveryRequest(requestUrl, token, debugMeta = {}) {
     console.log("Delhivery request:", {
       ...debugMeta,
       tokenPresent: Boolean(token),
-      tokenLength: token.length,
-      tokenPrefix: token.slice(0, 4),
       host: debugUrl.host,
       path: debugUrl.pathname,
       query: Object.fromEntries(debugUrl.searchParams.entries()),
@@ -546,8 +544,18 @@ async function delhiveryPostForm(requestUrl, token, formFields, debugMeta = {}) 
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams(formFields).toString(),
+      signal: AbortSignal.timeout(45000),
     });
   } catch (networkError) {
+    if (
+      networkError?.name === "TimeoutError" ||
+      networkError?.name === "AbortError"
+    ) {
+      const err = new Error("Delhivery request timed out");
+      err.code = "DELHIVERY_TIMEOUT";
+      err.cause = networkError;
+      throw err;
+    }
     const err = new Error("Delhivery service is currently unavailable");
     err.code = "DELHIVERY_NETWORK_ERROR";
     err.cause = networkError;

@@ -27,6 +27,7 @@ router.get("/waybill", fetchWaybills);
 router.get("/rate", calculateRate);
 router.post("/warehouse/create", createWarehouse);
 router.post("/shipment/create", createShipmentForOrder);
+router.post("/create-shipment", createShipmentForOrder);
 router.post("/shipment/update", updateShipmentDetails);
 router.post("/tracking", trackShipmentStatus);
 router.post("/label", generateLabel);
