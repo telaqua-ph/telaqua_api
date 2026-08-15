@@ -6,6 +6,26 @@
  */
 
 import { query } from "../config/db.js";
+import {
+  evaluatePromoApplicability,
+  promoEffectiveStatus,
+} from "../utils/promoValidity.js";
+
+const PROMO_COLUMNS = `
+  id,
+  platform,
+  language,
+  code,
+  original_price,
+  promo_price,
+  is_active,
+  usage_limit,
+  used_count,
+  created_at,
+  updated_at,
+  valid_from,
+  valid_until
+`;
 
 /**
  * Normalize a promo code for lookups.
@@ -32,7 +52,18 @@ function toNumber(value) {
  * Map a promo_codes row for API responses.
  * @param {object} row
  */
+function toIsoOrNull(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
 export function mapPromoRecord(row) {
+  const valid_from = toIsoOrNull(row.valid_from);
+  const valid_until = toIsoOrNull(row.valid_until);
+  const is_active = Boolean(row.is_active);
+
   return {
     id: row.id,
     platform: row.platform,
@@ -40,7 +71,7 @@ export function mapPromoRecord(row) {
     code: String(row.code).trim().toUpperCase(),
     original_price: toNumber(row.original_price),
     promo_price: toNumber(row.promo_price),
-    is_active: Boolean(row.is_active),
+    is_active,
     usage_limit:
       row.usage_limit === null || row.usage_limit === undefined
         ? null
@@ -48,6 +79,13 @@ export function mapPromoRecord(row) {
     used_count: Number(row.used_count ?? 0),
     created_at: row.created_at ?? undefined,
     updated_at: row.updated_at ?? undefined,
+    valid_from,
+    valid_until,
+    effective_status: promoEffectiveStatus({
+      is_active,
+      valid_from: row.valid_from,
+      valid_until: row.valid_until,
+    }),
   };
 }
 
@@ -94,21 +132,14 @@ export function isPromoWithinUsageLimit(row) {
  */
 export async function findOfferByPlatformLanguage(platform, language) {
   const { rows } = await query(
-    `SELECT
-       id,
-       platform,
-       language,
-       code,
-       original_price,
-       promo_price,
-       is_active,
-       usage_limit,
-       used_count
+    `SELECT ${PROMO_COLUMNS}
      FROM promo_codes
      WHERE LOWER(TRIM(platform)) = LOWER(TRIM($1))
        AND LOWER(TRIM(language)) = LOWER(TRIM($2))
        AND is_active = true
        AND (usage_limit IS NULL OR used_count < usage_limit)
+       AND (valid_from IS NULL OR valid_from <= CURRENT_TIMESTAMP)
+       AND (valid_until IS NULL OR valid_until >= CURRENT_TIMESTAMP)
      ORDER BY id ASC
      LIMIT 1`,
     [platform, language]
@@ -124,18 +155,7 @@ export async function findOfferByPlatformLanguage(platform, language) {
  */
 export async function findPromoByCode(code) {
   const { rows } = await query(
-    `SELECT
-       id,
-       platform,
-       language,
-       code,
-       original_price,
-       promo_price,
-       is_active,
-       usage_limit,
-       used_count,
-       created_at,
-       updated_at
+    `SELECT ${PROMO_COLUMNS}
      FROM promo_codes
      WHERE UPPER(TRIM(code)) = $1
      LIMIT 1`,
@@ -154,7 +174,8 @@ export async function findPromoByCode(code) {
 export async function findActivePromoByCode(code) {
   const row = await findPromoByCode(code);
   if (!row) return null;
-  if (!row.is_active) return null;
+  const timeCheck = evaluatePromoApplicability(row);
+  if (!timeCheck.ok) return null;
   if (!isPromoWithinUsageLimit(row)) return null;
   return row;
 }
@@ -187,18 +208,7 @@ export async function incrementPromoUsedCount(code) {
  */
 export async function listPromoCodes(status) {
   let sql = `
-    SELECT
-      id,
-      platform,
-      language,
-      code,
-      original_price,
-      promo_price,
-      is_active,
-      usage_limit,
-      used_count,
-      created_at,
-      updated_at
+    SELECT ${PROMO_COLUMNS}
     FROM promo_codes
   `;
   const params = [];
@@ -220,18 +230,7 @@ export async function listPromoCodes(status) {
  */
 export async function findPromoById(id) {
   const { rows } = await query(
-    `SELECT
-       id,
-       platform,
-       language,
-       code,
-       original_price,
-       promo_price,
-       is_active,
-       usage_limit,
-       used_count,
-       created_at,
-       updated_at
+    `SELECT ${PROMO_COLUMNS}
      FROM promo_codes
      WHERE id = $1
      LIMIT 1`,
@@ -255,22 +254,13 @@ export async function createPromoCode(data) {
        usage_limit,
        used_count,
        created_at,
-       updated_at
+       updated_at,
+       valid_from,
+       valid_until
      ) VALUES (
-       $1, $2, $3, $4, $5, $6, $7, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+       $1, $2, $3, $4, $5, $6, $7, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $8, $9
      )
-     RETURNING
-       id,
-       platform,
-       language,
-       code,
-       original_price,
-       promo_price,
-       is_active,
-       usage_limit,
-       used_count,
-       created_at,
-       updated_at`,
+     RETURNING ${PROMO_COLUMNS}`,
     [
       data.platform,
       data.language,
@@ -279,6 +269,8 @@ export async function createPromoCode(data) {
       data.promo_price,
       data.is_active,
       data.usage_limit,
+      data.valid_from,
+      data.valid_until,
     ]
   );
   return rows[0];
@@ -298,20 +290,11 @@ export async function updatePromoCode(id, data) {
        original_price = $4,
        promo_price = $5,
        usage_limit = $6,
+       valid_from = $7,
+       valid_until = $8,
        updated_at = CURRENT_TIMESTAMP
-     WHERE id = $7
-     RETURNING
-       id,
-       platform,
-       language,
-       code,
-       original_price,
-       promo_price,
-       is_active,
-       usage_limit,
-       used_count,
-       created_at,
-       updated_at`,
+     WHERE id = $9
+     RETURNING ${PROMO_COLUMNS}`,
     [
       data.platform,
       data.language,
@@ -319,6 +302,8 @@ export async function updatePromoCode(id, data) {
       data.original_price,
       data.promo_price,
       data.usage_limit,
+      data.valid_from,
+      data.valid_until,
       id,
     ]
   );
@@ -336,18 +321,7 @@ export async function updatePromoCodeStatus(id, isActive) {
        is_active = $1,
        updated_at = CURRENT_TIMESTAMP
      WHERE id = $2
-     RETURNING
-       id,
-       platform,
-       language,
-       code,
-       original_price,
-       promo_price,
-       is_active,
-       usage_limit,
-       used_count,
-       created_at,
-       updated_at`,
+     RETURNING ${PROMO_COLUMNS}`,
     [isActive, id]
   );
   return rows[0] || null;

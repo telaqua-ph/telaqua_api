@@ -15,6 +15,7 @@ import {
   updatePromoCodeStatus,
   promoCodeExists,
 } from "../services/promoService.js";
+import { parsePromoValidityRange } from "../utils/promoValidity.js";
 
 function trimStr(value) {
   return typeof value === "string" ? value.trim() : value;
@@ -24,6 +25,30 @@ function parseId(raw) {
   const id = Number(raw);
   if (!Number.isInteger(id) || id <= 0) return null;
   return id;
+}
+
+function toAdminPromo(rowOrMapped) {
+  const p =
+    rowOrMapped && rowOrMapped.effective_status !== undefined
+      ? rowOrMapped
+      : mapPromoRecord(rowOrMapped);
+
+  return {
+    id: p.id,
+    platform: p.platform,
+    language: p.language,
+    code: p.code,
+    original_price: p.original_price,
+    promo_price: p.promo_price,
+    is_active: p.is_active,
+    usage_limit: p.usage_limit,
+    used_count: p.used_count,
+    created_at: p.created_at,
+    updated_at: p.updated_at,
+    valid_from: p.valid_from ?? null,
+    valid_until: p.valid_until ?? null,
+    effective_status: p.effective_status,
+  };
 }
 
 /**
@@ -95,6 +120,11 @@ function validatePromoPayload(body, options = {}) {
     usage_limit = limit;
   }
 
+  const validity = parsePromoValidityRange(body.valid_from, body.valid_until);
+  if (!validity.ok) {
+    return { error: validity.error };
+  }
+
   return {
     data: {
       platform,
@@ -104,6 +134,8 @@ function validatePromoPayload(body, options = {}) {
       promo_price,
       is_active,
       usage_limit,
+      valid_from: validity.valid_from,
+      valid_until: validity.valid_until,
     },
   };
 }
@@ -129,22 +161,12 @@ export async function createPromoCodeHandler(req, res) {
     }
 
     const row = await createPromoCode(data);
-    const promoCode = mapPromoRecord(row);
+    const promoCode = toAdminPromo(mapPromoRecord(row));
 
     return res.status(201).json({
       success: true,
       message: "Promo code created successfully",
-      promoCode: {
-        id: promoCode.id,
-        platform: promoCode.platform,
-        language: promoCode.language,
-        code: promoCode.code,
-        original_price: promoCode.original_price,
-        promo_price: promoCode.promo_price,
-        is_active: promoCode.is_active,
-        usage_limit: promoCode.usage_limit,
-        used_count: promoCode.used_count,
-      },
+      promoCode,
     });
   } catch (error) {
     console.error("Create promo code error:", error?.message || error);
@@ -170,22 +192,7 @@ export async function listPromoCodesHandler(req, res) {
     }
 
     const rows = await listPromoCodes(status);
-    const promoCodes = rows.map((row) => {
-      const p = mapPromoRecord(row);
-      return {
-        id: p.id,
-        platform: p.platform,
-        language: p.language,
-        code: p.code,
-        original_price: p.original_price,
-        promo_price: p.promo_price,
-        is_active: p.is_active,
-        usage_limit: p.usage_limit,
-        used_count: p.used_count,
-        created_at: p.created_at,
-        updated_at: p.updated_at,
-      };
-    });
+    const promoCodes = rows.map((row) => toAdminPromo(mapPromoRecord(row)));
 
     return res.status(200).json({
       success: true,
@@ -222,19 +229,7 @@ export async function getPromoCodeHandler(req, res) {
     const p = mapPromoRecord(row);
     return res.status(200).json({
       success: true,
-      promoCode: {
-        id: p.id,
-        platform: p.platform,
-        language: p.language,
-        code: p.code,
-        original_price: p.original_price,
-        promo_price: p.promo_price,
-        is_active: p.is_active,
-        usage_limit: p.usage_limit,
-        used_count: p.used_count,
-        created_at: p.created_at,
-        updated_at: p.updated_at,
-      },
+      promoCode: toAdminPromo(p),
     });
   } catch (error) {
     console.error("Get promo code error:", error?.message || error);
@@ -287,19 +282,7 @@ export async function updatePromoCodeHandler(req, res) {
     return res.status(200).json({
       success: true,
       message: "Promo code updated successfully",
-      promoCode: {
-        id: p.id,
-        platform: p.platform,
-        language: p.language,
-        code: p.code,
-        original_price: p.original_price,
-        promo_price: p.promo_price,
-        is_active: p.is_active,
-        usage_limit: p.usage_limit,
-        used_count: p.used_count,
-        created_at: p.created_at,
-        updated_at: p.updated_at,
-      },
+      promoCode: toAdminPromo(p),
     });
   } catch (error) {
     console.error("Update promo code error:", error?.message || error);
@@ -338,15 +321,12 @@ export async function updatePromoCodeStatusHandler(req, res) {
     }
 
     const row = await updatePromoCodeStatus(id, body.is_active);
+    const p = mapPromoRecord(row);
 
     return res.status(200).json({
       success: true,
       message: "Promo code status updated successfully",
-      promoCode: {
-        id: row.id,
-        code: String(row.code).trim().toUpperCase(),
-        is_active: Boolean(row.is_active),
-      },
+      promoCode: toAdminPromo(p),
     });
   } catch (error) {
     console.error("Update promo status error:", error?.message || error);

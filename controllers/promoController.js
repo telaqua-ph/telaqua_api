@@ -12,6 +12,7 @@ import {
   findPromoByCode,
   isPromoWithinUsageLimit,
 } from "../services/promoService.js";
+import { evaluatePromoApplicability } from "../utils/promoValidity.js";
 
 const ALLOWED_PLATFORMS = [
   "Facebook",
@@ -138,7 +139,16 @@ export async function validatePromoCode(req, res) {
       return res.status(400).json({
         success: false,
         valid: false,
-        message: "This coupon is no longer active",
+        message: "This coupon is currently inactive.",
+      });
+    }
+
+    const timeCheck = evaluatePromoApplicability(row);
+    if (!timeCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: timeCheck.message,
       });
     }
 

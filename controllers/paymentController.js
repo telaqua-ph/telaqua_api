@@ -11,9 +11,11 @@ import { query } from "../config/db.js";
 import { getRazorpayClient } from "../config/razorpay.js";
 import {
   normalizePromoCode,
-  findActivePromoByCode,
+  findPromoByCode,
   mapPromoPricing,
+  isPromoWithinUsageLimit,
 } from "../services/promoService.js";
+import { evaluatePromoApplicability } from "../utils/promoValidity.js";
 import {
   confirmCapturedRazorpayPayment,
   logPaymentEvent,
@@ -305,9 +307,18 @@ async function resolveOrderPricing(orderData) {
     };
   }
 
-  const row = await findActivePromoByCode(orderData.promo_code);
+  const row = await findPromoByCode(orderData.promo_code);
   if (!row) {
     return { error: "Invalid or inactive promo code" };
+  }
+
+  const timeCheck = evaluatePromoApplicability(row);
+  if (!timeCheck.ok) {
+    return { error: timeCheck.message };
+  }
+
+  if (!isPromoWithinUsageLimit(row)) {
+    return { error: "This coupon has reached its usage limit" };
   }
 
   const promo = mapPromoPricing(row);
