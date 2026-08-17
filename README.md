@@ -97,7 +97,7 @@ npm run deploy
 | `GET` | `/api/customer/orders` | Authenticated customer's order history |
 | `GET` | `/api/customer/orders/recent` | Authenticated customer's recent active order |
 | `GET` | `/api/customer/orders/:orderId` | Authenticated customer's owned order |
-| `GET` | `/api/customer/orders/:orderId/tracking` | Owned-order Delhivery tracking |
+| `GET` | `/api/customer/orders/:orderId/tracking` | Owned-order AWB from Neon (no live Delhivery tracking) |
 | `GET` | `/api/dashboard/stats` | Dashboard metrics (admin) |
 
 > Handlers currently contain placeholders only. Business logic will be added next.

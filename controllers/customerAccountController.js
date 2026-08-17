@@ -15,7 +15,6 @@ import {
   sendOtp,
 } from "../services/interaktOtpService.js";
 import { getInteraktConfigurationStatus } from "../services/interaktService.js";
-import { trackShipment } from "../services/delhiveryService.js";
 
 const OTP_EXPIRY_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 5;
@@ -24,8 +23,6 @@ const OTP_PHONE_WINDOW_MINUTES = 15;
 const OTP_PHONE_WINDOW_LIMIT = 5;
 const OTP_IP_WINDOW_MINUTES = 60;
 const OTP_IP_WINDOW_LIMIT = 20;
-const TRACKING_CACHE_MS = 5 * 60 * 1000;
-const trackingCache = new Map();
 
 const PHONE_MATCH_SQL = `
   REGEXP_REPLACE(phone, '[^0-9]', '', 'g') IN ($1, '91' || $1, '0' || $1)
@@ -422,95 +419,44 @@ export async function getCustomerOrder(req, res) {
   return res.status(200).json({ success: true, order: safeOrder(order, req, true) });
 }
 
-function safeTracking(data, order) {
-  const shipmentData = Array.isArray(data?.ShipmentData) ? data.ShipmentData[0] : null;
-  const shipment = shipmentData?.Shipment || data?.Shipment || {};
-  const status = shipment?.Status || {};
-  const scans = Array.isArray(shipment?.Scans) ? shipment.Scans : [];
-  return {
-    available: true,
-    awb: String(order.waybill),
-    status: status.Status || status.StatusType || order.tracking_status || null,
-    current_location: status.StatusLocation || null,
-    estimated_delivery: shipment.ExpectedDeliveryDate || shipment.EDD || null,
-    updated_at: status.StatusDateTime || order.tracking_updated_at || null,
-    events: scans.slice(0, 50).map((entry) => {
-      const detail = entry?.ScanDetail || entry || {};
-      return {
-        status: detail.Scan || detail.Instructions || null,
-        location: detail.ScannedLocation || null,
-        timestamp: detail.ScanDateTime || null,
-      };
-    }),
-  };
-}
-
 export async function trackCustomerOrder(req, res) {
   const order = await loadOwnedOrder(req.params.orderId, req.customer.phone);
   if (!order) {
     return missingOwnedOrderResponse(req.params.orderId, res);
   }
-  if (!order.waybill) {
+
+  const awb = order.waybill ? String(order.waybill).trim() : "";
+  if (!awb) {
     return res.status(200).json({
       success: true,
       order_number: order.order_number,
       tracking: {
         available: false,
         awb: null,
+        waybill: null,
         status: order.shipment_status || "Not Created",
         current_location: null,
         estimated_delivery: null,
         updated_at: order.tracking_updated_at || null,
+        tracking_url: null,
         events: [],
       },
     });
   }
 
-  const cached = trackingCache.get(order.id);
-  if (cached && cached.expiresAt > Date.now()) {
-    return res.status(200).json({
-      success: true,
-      order_number: order.order_number,
-      tracking: cached.tracking,
-      cached: true,
-    });
-  }
-  try {
-    const data = await trackShipment(order.waybill);
-    const tracking = safeTracking(data, order);
-    trackingCache.set(order.id, { tracking, expiresAt: Date.now() + TRACKING_CACHE_MS });
-    await query(
-      `UPDATE orders SET tracking_status = COALESCE($2, tracking_status),
-         tracking_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [order.id, tracking.status]
-    );
-    return res.status(200).json({
-      success: true,
-      order_number: order.order_number,
-      tracking,
-      cached: false,
-    });
-  } catch (error) {
-    console.error("Customer Delhivery tracking error:", {
-      orderId: order.id,
-      code: error?.code,
-      status: error?.status,
-      message: error?.message,
-    });
-    return res.status(502).json({
-      success: false,
-      message: "Tracking service is currently unavailable",
-      order_number: order.order_number,
-      tracking: {
-        available: true,
-        awb: String(order.waybill),
-        status: order.tracking_status || order.shipment_status || null,
-        current_location: null,
-        estimated_delivery: null,
-        updated_at: order.tracking_updated_at || null,
-        events: [],
-      },
-    });
-  }
+  return res.status(200).json({
+    success: true,
+    order_number: order.order_number,
+    tracking: {
+      available: true,
+      awb,
+      waybill: awb,
+      status: order.shipment_status || order.tracking_status || "Created",
+      current_location: null,
+      estimated_delivery: null,
+      updated_at: order.shipment_created_at || order.tracking_updated_at || null,
+      tracking_url: `https://www.delhivery.com/track/package/${encodeURIComponent(awb)}`,
+      events: [],
+    },
+  });
 }

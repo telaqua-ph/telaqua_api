@@ -144,7 +144,6 @@ app.use("/api/customers", customersRoutes);
 app.use("/api/customer", customerAccountRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/delivery", deliveryRoutes);
-// Alias requested for TAT docs/Postman: /api/delhivery/...
 app.use("/api/delhivery", deliveryRoutes);
 
 // 404 fallback
