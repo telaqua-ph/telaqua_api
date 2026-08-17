@@ -287,7 +287,19 @@ function mapPaymentMode(paymentMethod) {
 }
 
 /**
- * Read required shipment config from env (warehouse name + product weight).
+ * Parse a positive integer env var used for package dimensions (cm).
+ * @param {string} name
+ * @returns {number|null}
+ */
+function parsePositiveIntEnv(name) {
+  const raw = (process.env[name] || "").trim();
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * Read required shipment config from env (warehouse name + product weight + dimensions).
  * @returns {{ ok: true, config: object } | { ok: false, message: string }}
  */
 function getShipmentConfig() {
@@ -297,6 +309,9 @@ function getShipmentConfig() {
     "Tel-Aqua Product"
   ).trim();
   const weightRaw = (process.env.TELAQUA_PRODUCT_WEIGHT_GM || "").trim();
+  const lengthCm = parsePositiveIntEnv("TELAQUA_PRODUCT_LENGTH_CM");
+  const widthCm = parsePositiveIntEnv("TELAQUA_PRODUCT_WIDTH_CM");
+  const heightCm = parsePositiveIntEnv("TELAQUA_PRODUCT_HEIGHT_CM");
 
   if (!warehouseName) {
     return {
@@ -322,12 +337,27 @@ function getShipmentConfig() {
     };
   }
 
+  if (lengthCm === null || widthCm === null || heightCm === null) {
+    return {
+      ok: false,
+      message:
+        "Actual Tel-Aqua package dimensions are not currently configured. Please provide Length × Width × Height.",
+    };
+  }
+
   return {
     ok: true,
     config: {
       warehouseName,
       productName: sanitizeDelhiveryText(productName) || "Tel-Aqua Product",
       weightGm,
+      lengthCm,
+      widthCm,
+      heightCm,
+      sellerName: (
+        process.env.TELAQUA_BUSINESS_NAME ||
+        "Tel-Aqua"
+      ).trim(),
       warehousePhone: (process.env.TELAQUA_WAREHOUSE_PHONE || "").trim(),
       warehouseAddress: (process.env.TELAQUA_WAREHOUSE_ADDRESS || "").trim(),
       warehouseCity: (process.env.TELAQUA_WAREHOUSE_CITY || "").trim(),
@@ -349,6 +379,34 @@ function orderChargeAmount(order) {
   return n;
 }
 
+function buildPickupLocation(config) {
+  const pickup_location = {
+    name: config.warehouseName,
+  };
+
+  if (config.warehouseAddress) {
+    pickup_location.add = sanitizeDelhiveryText(config.warehouseAddress);
+  }
+  if (config.warehouseCity) {
+    pickup_location.city = sanitizeDelhiveryText(config.warehouseCity);
+  }
+  if (config.warehousePincode && /^\d{6}$/.test(config.warehousePincode)) {
+    pickup_location.pin = config.warehousePincode;
+  }
+  if (config.warehousePhone) {
+    pickup_location.phone = config.warehousePhone;
+  }
+  if (
+    pickup_location.add ||
+    pickup_location.city ||
+    pickup_location.pin
+  ) {
+    pickup_location.country = "India";
+  }
+
+  return pickup_location;
+}
+
 function buildShipmentPayload(order, config, paymentMode) {
   const totalAmount = orderChargeAmount(order);
   const quantity = Number(order.quantity);
@@ -367,10 +425,20 @@ function buildShipmentPayload(order, config, paymentMode) {
     quantity: String(quantity),
     total_amount: totalAmount,
     weight: `${config.weightGm}`,
+    shipment_length: config.lengthCm,
+    shipment_width: config.widthCm,
+    shipment_height: config.heightCm,
   };
 
   if (paymentMode === "COD") {
     shipment.cod_amount = String(totalAmount);
+  }
+
+  if (config.sellerName) {
+    shipment.seller_name = sanitizeDelhiveryText(config.sellerName);
+  }
+  if (config.warehouseAddress) {
+    shipment.seller_add = sanitizeDelhiveryText(config.warehouseAddress);
   }
 
   // Optional return-to-warehouse fields when fully configured
@@ -392,9 +460,7 @@ function buildShipmentPayload(order, config, paymentMode) {
   }
 
   return {
-    pickup_location: {
-      name: config.warehouseName,
-    },
+    pickup_location: buildPickupLocation(config),
     shipments: [shipment],
   };
 }
@@ -1140,7 +1206,13 @@ export async function createShipmentForOrder(req, res) {
       quantity: payload.shipments?.[0]?.quantity,
       payment_mode: payload.shipments?.[0]?.payment_mode,
       warehouse: payload.pickup_location?.name,
+      warehouse_add: payload.pickup_location?.add || null,
+      warehouse_city: payload.pickup_location?.city || null,
+      warehouse_pin: payload.pickup_location?.pin || null,
       weight: payload.shipments?.[0]?.weight,
+      shipment_length: payload.shipments?.[0]?.shipment_length,
+      shipment_width: payload.shipments?.[0]?.shipment_width,
+      shipment_height: payload.shipments?.[0]?.shipment_height,
     });
 
     const data = await createShipment(payload);
