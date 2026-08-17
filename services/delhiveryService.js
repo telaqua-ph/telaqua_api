@@ -11,7 +11,7 @@
  * - Shipment / package edit (update)
  * - Shipment tracking (staging only for this integration step)
  * - Packing slip / shipping label (staging only for this integration step)
- * - Pickup request (staging only for this integration step)
+ * - Pickup request
  * - NDR package action update (staging only for this integration step)
  *
  * Token and URLs come from process.env — never hardcoded or fully logged.
@@ -280,24 +280,22 @@ function getLabelBaseUrl() {
 }
 
 /**
- * Resolve Pickup Request URL.
- * This integration step uses STAGING ONLY — never production pickup URL.
+ * Resolve Pickup Request URL (fm/request/new/).
  * @returns {{ env: string, baseUrl: string }}
  */
 function getPickupBaseUrl() {
   const env = getDelhiveryEnv();
 
-  if (env !== "staging") {
-    const err = new Error(
-      'Pickup API is staging-only. Set DELHIVERY_ENV=staging to use DELHIVERY_STAGING_PICKUP_URL'
-    );
-    err.code = "DELHIVERY_CONFIG_ERROR";
-    throw err;
+  if (env === "staging") {
+    return {
+      env,
+      baseUrl: requireEnvUrl("DELHIVERY_STAGING_PICKUP_URL"),
+    };
   }
 
   return {
     env,
-    baseUrl: requireEnvUrl("DELHIVERY_STAGING_PICKUP_URL"),
+    baseUrl: requireEnvUrl("DELHIVERY_PRODUCTION_PICKUP_URL"),
   };
 }
 
@@ -869,7 +867,7 @@ export async function generateShippingLabel(waybill) {
 
 /**
  * Create a Delhivery pickup request for a registered warehouse.
- * Staging only — uses DELHIVERY_STAGING_PICKUP_URL exclusively.
+ * Official endpoint: POST /fm/request/new/
  * @param {{
  *   pickup_time: string,
  *   pickup_date: string,
@@ -889,11 +887,31 @@ export async function requestPickup(payload) {
 
   const { env, baseUrl } = getPickupBaseUrl();
   console.log(`Delhivery pickup environment: ${env}`);
+  console.log("Delhivery pickup request payload:", {
+    endpoint: baseUrl,
+    pickup_date: payload.pickup_date,
+    pickup_time: payload.pickup_time,
+    pickup_location: payload.pickup_location,
+    expected_package_count: payload.expected_package_count,
+  });
 
-  return delhiveryPost(baseUrl, token, payload, {
+  const data = await delhiveryPost(baseUrl, token, payload, {
     api: "pickup_request",
     env,
   });
+
+  console.log("Delhivery pickup response:", {
+    pickup_id: data?.pickup_id ?? null,
+    pickup_location_name: data?.pickup_location_name ?? null,
+    incoming_center_name: data?.incoming_center_name ?? null,
+    client_name: data?.client_name ?? null,
+    error:
+      (typeof data?.error === "string" && data.error) ||
+      (typeof data?.pickup_location === "string" && data.pickup_location) ||
+      null,
+  });
+
+  return data;
 }
 
 /**

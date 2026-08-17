@@ -780,6 +780,107 @@ async function recordShipmentError(orderId, message) {
 }
 
 /**
+ * Persist pickup request confirmation on the SAME orders row.
+ * Only called after Delhivery returns a pickup_id.
+ * @param {number} orderId
+ * @param {{ pickupId: string }} payload
+ */
+async function persistPickupOnOrder(orderId, { pickupId }) {
+  try {
+    const { rows } = await query(
+      `UPDATE orders SET
+         pickup_status = 'Requested',
+         pickup_requested_at = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING id, pickup_status, pickup_requested_at, waybill`,
+      [orderId]
+    );
+    console.log("Pickup saved on orders row:", {
+      order_id: orderId,
+      pickup_id: pickupId,
+      waybill: rows[0]?.waybill || null,
+      pickup_status: rows[0]?.pickup_status || null,
+    });
+    return rows[0] || null;
+  } catch (err) {
+    if (err?.code === "42703") {
+      console.warn(
+        "Cannot save pickup_status: orders column missing — pickup was still created at Delhivery",
+        { order_id: orderId, pickup_id: pickupId }
+      );
+      return null;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Interpret Delhivery Pickup Request Creation API responses.
+ * Success requires pickup_id — never treat HTTP 200/201 alone as created.
+ * @param {any} data
+ */
+function interpretPickupCreateResult(data) {
+  if (!data || typeof data !== "object") {
+    return {
+      ok: false,
+      status: 502,
+      message: "Delhivery returned an invalid or unexpected pickup response",
+      pickupId: null,
+    };
+  }
+
+  const pickupIdRaw = data.pickup_id ?? data.pickupId ?? data.id ?? null;
+  const pickupId =
+    pickupIdRaw !== null && pickupIdRaw !== undefined && String(pickupIdRaw).trim() !== ""
+      ? String(pickupIdRaw).trim()
+      : null;
+
+  const errorCandidates = [
+    data.error,
+    data.pickup_location,
+    data.detail,
+    data.message,
+  ];
+  const errorMessage = errorCandidates.find(
+    (value) => typeof value === "string" && value.trim()
+  );
+
+  if (pickupId) {
+    return { ok: true, pickupId, data };
+  }
+
+  if (data.success === false || errorMessage) {
+    const message = errorMessage || "Delhivery did not accept the pickup request";
+    const lower = message.toLowerCase();
+    const status = lower.includes("invalid pickup location") ||
+      lower.includes("does not exist") ||
+      lower.includes("doesn't exist")
+      ? 400
+      : 400;
+    return { ok: false, status, message, pickupId: null };
+  }
+
+  return {
+    ok: false,
+    status: 502,
+    message: "Delhivery pickup request succeeded but no pickup_id was returned",
+    pickupId: null,
+  };
+}
+
+function isPickupAlreadyRequested(order) {
+  const status = String(order?.pickup_status || order?.pickupStatus || "")
+    .trim()
+    .toLowerCase();
+  return (
+    status === "requested" ||
+    status === "pickup requested" ||
+    (Boolean(order?.pickup_requested_at) && status !== "not requested")
+  );
+}
+
+/**
  * GET /api/delivery/serviceability/:pincode
  * (also available under /api/delhivery/...)
  */
@@ -1664,9 +1765,11 @@ const PICKUP_REQUIRED_FIELDS = [
   "pickup_location",
   "expected_package_count",
 ];
+const PICKUP_BODY_FIELDS = [...PICKUP_REQUIRED_FIELDS, "order_id"];
 
 /**
  * Build/validate Delhivery pickup request payload.
+ * Optional order_id is accepted for linking/logging but is not sent to Delhivery.
  * @param {object} body
  * @returns {{ ok: true, payload: object } | { ok: false, message: string }}
  */
@@ -1676,19 +1779,23 @@ function buildPickupPayload(body) {
   }
 
   const unknownKeys = Object.keys(body).filter(
-    (key) => !PICKUP_REQUIRED_FIELDS.includes(key)
+    (key) => !PICKUP_BODY_FIELDS.includes(key)
   );
   if (unknownKeys.length > 0) {
     return {
       ok: false,
-      message: `Unsupported field(s): ${unknownKeys.join(", ")}. Allowed: ${PICKUP_REQUIRED_FIELDS.join(", ")}`,
+      message: `Unsupported field(s): ${unknownKeys.join(", ")}. Allowed: ${PICKUP_BODY_FIELDS.join(", ")}`,
     };
   }
 
   const pickup_time = String(body.pickup_time ?? "").trim();
   const pickup_date = String(body.pickup_date ?? "").trim();
-  const pickup_location = String(body.pickup_location ?? "").trim();
+  let pickup_location = String(body.pickup_location ?? "").trim();
   const countRaw = body.expected_package_count;
+
+  if (!pickup_location) {
+    pickup_location = readEnvText("TELAQUA_WAREHOUSE_NAME");
+  }
 
   if (!pickup_time) {
     return { ok: false, message: "pickup_time is required (HH:MM:SS)" };
@@ -1728,7 +1835,7 @@ function buildPickupPayload(body) {
     return {
       ok: false,
       message:
-        "pickup_location is required (exact registered Delhivery warehouse name)",
+        "pickup_location is required (exact registered Delhivery warehouse name). Set TELAQUA_WAREHOUSE_NAME or pass pickup_location in the request body.",
     };
   }
 
@@ -1774,12 +1881,65 @@ function buildPickupPayload(body) {
  * POST /api/delhivery/pickup
  * Also available under /api/delivery/pickup
  *
- * Creates a Delhivery pickup request (staging only).
- * Does NOT read/write the orders table.
+ * Creates a Delhivery pickup request (fm/request/new/).
+ * Optional order_id links the request to an existing manifested order (AWB required).
+ * pickup_status is updated only after Delhivery returns pickup_id.
  */
 export async function createPickupRequest(req, res) {
   try {
-    const built = buildPickupPayload(req.body);
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const rawOrderId = body.order_id ?? body.orderId;
+    const hasOrderId =
+      rawOrderId !== undefined &&
+      rawOrderId !== null &&
+      String(rawOrderId).trim() !== "";
+
+    let order = null;
+    if (hasOrderId) {
+      const orderId = Number(rawOrderId);
+      if (!Number.isInteger(orderId) || orderId <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "order_id must be a positive integer",
+        });
+      }
+
+      const { rows } = await query(`SELECT * FROM orders WHERE id = $1`, [
+        orderId,
+      ]);
+      order = rows[0] || null;
+      if (!order) {
+        return res.status(404).json({
+          success: false,
+          message: "Order not found",
+        });
+      }
+
+      const awb = existingOrderAwb(order);
+      if (!awb) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Cannot request pickup before a Delhivery AWB exists on this order",
+          order_id: order.id,
+          order_number: order.order_number,
+        });
+      }
+
+      if (isPickupAlreadyRequested(order)) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Pickup was already requested for this order. Do not submit duplicate pickup requests for the same shipment.",
+          order_id: order.id,
+          order_number: order.order_number,
+          pickup_status: order.pickup_status || "Requested",
+          pickup_requested_at: order.pickup_requested_at || null,
+        });
+      }
+    }
+
+    const built = buildPickupPayload(body);
     if (!built.ok) {
       return res.status(400).json({
         success: false,
@@ -1787,12 +1947,50 @@ export async function createPickupRequest(req, res) {
       });
     }
 
+    console.log("Delhivery pickup create request:", {
+      order_id: order?.id || null,
+      order_number: order?.order_number || null,
+      waybill: order ? existingOrderAwb(order) : null,
+      pickup_date: built.payload.pickup_date,
+      pickup_time: built.payload.pickup_time,
+      pickup_location: built.payload.pickup_location,
+      expected_package_count: built.payload.expected_package_count,
+    });
+
     const data = await requestPickup(built.payload);
+    const interpreted = interpretPickupCreateResult(data);
+
+    if (!interpreted.ok) {
+      console.error("Delhivery pickup request failed:", {
+        order_id: order?.id || null,
+        message: interpreted.message,
+        response: data,
+      });
+      return res.status(interpreted.status).json({
+        success: false,
+        message: interpreted.message,
+        order_id: order?.id || null,
+        order_number: order?.order_number || null,
+        data,
+      });
+    }
+
+    let savedOrder = null;
+    if (order) {
+      savedOrder = await persistPickupOnOrder(order.id, {
+        pickupId: interpreted.pickupId,
+      });
+    }
 
     return res.status(200).json({
       success: true,
-      message: "Pickup request submitted successfully",
-      data,
+      message: "Pickup request created successfully",
+      pickup_id: interpreted.pickupId,
+      pickup_status: savedOrder?.pickup_status || (order ? "Requested" : null),
+      pickup_requested_at: savedOrder?.pickup_requested_at || null,
+      order_id: order?.id || null,
+      order_number: order?.order_number || null,
+      data: interpreted.data,
     });
   } catch (error) {
     return handleDelhiveryError(res, error, "Delivery pickup");
