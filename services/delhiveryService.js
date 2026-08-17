@@ -170,6 +170,32 @@ function getWarehouseCreateBaseUrl() {
 }
 
 /**
+ * Resolve Client Warehouse Edit URL from env, or derive it from the create URL.
+ * Official path: /api/backend/clientwarehouse/edit/
+ * @returns {{ env: string, baseUrl: string }}
+ */
+function getWarehouseEditBaseUrl() {
+  const env = getDelhiveryEnv();
+  const explicitName =
+    env === "staging"
+      ? "DELHIVERY_STAGING_WAREHOUSE_EDIT_URL"
+      : "DELHIVERY_PRODUCTION_WAREHOUSE_EDIT_URL";
+  const explicit = (process.env[explicitName] || "").trim();
+  if (explicit) {
+    return { env, baseUrl: explicit };
+  }
+
+  const createUrl = getWarehouseCreateBaseUrl().baseUrl;
+  const derived = String(createUrl).replace(/\/create\/?$/i, "/edit/");
+  if (!derived || derived === createUrl) {
+    const err = new Error(`${explicitName} is not configured`);
+    err.code = "DELHIVERY_CONFIG_ERROR";
+    throw err;
+  }
+  return { env, baseUrl: derived };
+}
+
+/**
  * Resolve Shipment / Package Creation (CMU) URL from env.
  * @returns {{ env: string, baseUrl: string }}
  */
@@ -702,6 +728,30 @@ export async function createClientWarehouse(payload) {
 
   return delhiveryPost(baseUrl, token, payload, {
     api: "client_warehouse_create",
+    env,
+  });
+}
+
+/**
+ * Update an existing registered Delhivery pickup warehouse.
+ * Documented fields: name, address, pin, phone, registered_name.
+ * @param {object} payload
+ * @returns {Promise<any>}
+ */
+export async function updateClientWarehouse(payload) {
+  const token = getDelhiveryApiToken();
+
+  if (!token) {
+    const err = new Error("DELHIVERY_API_TOKEN is not configured");
+    err.code = "DELHIVERY_CONFIG_ERROR";
+    throw err;
+  }
+
+  const { env, baseUrl } = getWarehouseEditBaseUrl();
+  console.log(`Delhivery warehouse edit environment: ${env}`);
+
+  return delhiveryPost(baseUrl, token, payload, {
+    api: "client_warehouse_edit",
     env,
   });
 }

@@ -21,6 +21,7 @@ import {
   getWaybills,
   getShippingRate,
   createClientWarehouse,
+  updateClientWarehouse,
   createShipment,
   updateShipment,
   trackShipment,
@@ -287,6 +288,19 @@ function mapPaymentMode(paymentMethod) {
 }
 
 /**
+ * Read an env string, collapsing Hostinger/multiline whitespace.
+ * @param {string} name
+ * @returns {string}
+ */
+function readEnvText(name) {
+  return String(process.env[name] || "")
+    .replace(/\r\n/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * Parse a positive integer env var used for package dimensions (cm).
  * @param {string} name
  * @returns {number|null}
@@ -303,7 +317,12 @@ function parsePositiveIntEnv(name) {
  * @returns {{ ok: true, config: object } | { ok: false, message: string }}
  */
 function getShipmentConfig() {
-  const warehouseName = (process.env.TELAQUA_WAREHOUSE_NAME || "").trim();
+  const warehouseName = readEnvText("TELAQUA_WAREHOUSE_NAME");
+  const warehouseAddress = readEnvText("TELAQUA_WAREHOUSE_ADDRESS");
+  const warehouseCity = readEnvText("TELAQUA_WAREHOUSE_CITY");
+  const warehouseState = readEnvText("TELAQUA_WAREHOUSE_STATE");
+  const warehousePincode = readEnvText("TELAQUA_WAREHOUSE_PINCODE");
+  const warehousePhone = readEnvText("TELAQUA_WAREHOUSE_PHONE");
   const productName = (
     process.env.TELAQUA_PRODUCT_NAME ||
     "Tel-Aqua Product"
@@ -318,6 +337,14 @@ function getShipmentConfig() {
       ok: false,
       message:
         "TELAQUA_WAREHOUSE_NAME is not configured. Set it to the exact Delhivery warehouse/pickup location name.",
+    };
+  }
+
+  if (!warehouseAddress) {
+    return {
+      ok: false,
+      message:
+        "TELAQUA_WAREHOUSE_ADDRESS is not configured. Set the full Tel-Aqua pickup/warehouse street address.",
     };
   }
 
@@ -358,11 +385,11 @@ function getShipmentConfig() {
         process.env.TELAQUA_BUSINESS_NAME ||
         "Tel-Aqua"
       ).trim(),
-      warehousePhone: (process.env.TELAQUA_WAREHOUSE_PHONE || "").trim(),
-      warehouseAddress: (process.env.TELAQUA_WAREHOUSE_ADDRESS || "").trim(),
-      warehouseCity: (process.env.TELAQUA_WAREHOUSE_CITY || "").trim(),
-      warehouseState: (process.env.TELAQUA_WAREHOUSE_STATE || "").trim(),
-      warehousePincode: (process.env.TELAQUA_WAREHOUSE_PINCODE || "").trim(),
+      warehousePhone,
+      warehouseAddress,
+      warehouseCity,
+      warehouseState,
+      warehousePincode,
     },
   };
 }
@@ -380,13 +407,13 @@ function orderChargeAmount(order) {
 }
 
 function buildPickupLocation(config) {
+  // Official CMU pickup_location: `name` is the registered warehouse lookup key.
+  // `add` is the documented street-address field on the same object.
   const pickup_location = {
     name: config.warehouseName,
+    add: sanitizeDelhiveryText(config.warehouseAddress),
   };
 
-  if (config.warehouseAddress) {
-    pickup_location.add = sanitizeDelhiveryText(config.warehouseAddress);
-  }
   if (config.warehouseCity) {
     pickup_location.city = sanitizeDelhiveryText(config.warehouseCity);
   }
@@ -396,13 +423,7 @@ function buildPickupLocation(config) {
   if (config.warehousePhone) {
     pickup_location.phone = config.warehousePhone;
   }
-  if (
-    pickup_location.add ||
-    pickup_location.city ||
-    pickup_location.pin
-  ) {
-    pickup_location.country = "India";
-  }
+  pickup_location.country = "India";
 
   return pickup_location;
 }
@@ -463,6 +484,62 @@ function buildShipmentPayload(order, config, paymentMode) {
     pickup_location: buildPickupLocation(config),
     shipments: [shipment],
   };
+}
+
+let lastSyncedRegisteredWarehouseKey = "";
+
+/**
+ * Delhivery One displays the *registered* warehouse address looked up by
+ * pickup_location.name. CMU `pickup_location.add` is often ignored in the UI.
+ * Sync the documented Client Warehouse Edit `address` field from env.
+ * @param {object} config
+ */
+async function syncRegisteredPickupWarehouse(config) {
+  const name = config.warehouseName;
+  const address = sanitizeDelhiveryText(config.warehouseAddress);
+  const pin = config.warehousePincode;
+
+  if (!name || !address || !/^\d{6}$/.test(pin)) {
+    console.warn(
+      "Skipping Delhivery warehouse address sync: name, TELAQUA_WAREHOUSE_ADDRESS, or TELAQUA_WAREHOUSE_PINCODE is incomplete"
+    );
+    return;
+  }
+
+  const payload = { name, address, pin };
+  const phoneDigits = String(config.warehousePhone || "").replace(/\D/g, "");
+  if (phoneDigits.length >= 7 && phoneDigits.length <= 15) {
+    payload.phone = phoneDigits;
+  }
+
+  const syncKey = `${payload.name}|${payload.address}|${payload.pin}|${payload.phone || ""}`;
+  if (lastSyncedRegisteredWarehouseKey === syncKey) {
+    console.log("Delhivery registered warehouse address already synced this process");
+    return;
+  }
+
+  try {
+    const data = await updateClientWarehouse(payload);
+    const failed =
+      data?.success === false ||
+      (typeof data?.error === "string" && data.error.trim() !== "");
+    console.log("Delhivery registered warehouse address sync:", {
+      name: payload.name,
+      address: payload.address,
+      pin: payload.pin,
+      success: !failed,
+      message: data?.data?.message || data?.message || data?.error || null,
+    });
+    if (!failed) {
+      lastSyncedRegisteredWarehouseKey = syncKey;
+    }
+  } catch (error) {
+    console.error("Delhivery registered warehouse address sync failed:", {
+      code: error?.code,
+      status: error?.status,
+      message: error?.message,
+    });
+  }
 }
 
 /**
@@ -1209,11 +1286,14 @@ export async function createShipmentForOrder(req, res) {
       warehouse_add: payload.pickup_location?.add || null,
       warehouse_city: payload.pickup_location?.city || null,
       warehouse_pin: payload.pickup_location?.pin || null,
+      warehouse_phone: payload.pickup_location?.phone || null,
       weight: payload.shipments?.[0]?.weight,
       shipment_length: payload.shipments?.[0]?.shipment_length,
       shipment_width: payload.shipments?.[0]?.shipment_width,
       shipment_height: payload.shipments?.[0]?.shipment_height,
     });
+
+    await syncRegisteredPickupWarehouse(configResult.config);
 
     const data = await createShipment(payload);
     const interpreted = interpretShipmentCreateResult(data);
