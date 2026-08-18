@@ -53,17 +53,89 @@ function mapStatsRow(row, from, to) {
   };
 }
 
-async function fetchDashboardStats({ adminId, from, to, includeIsTestOrder = true, includeViews = true }) {
+async function readOrdersColumns() {
+  const { rows } = await query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'orders'`
+  );
+  return new Set(rows.map((row) => row.column_name));
+}
+
+async function hasAdminOrderViewsTable() {
+  const { rows } = await query(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM information_schema.tables
+       WHERE table_schema = 'public'
+         AND table_name = 'admin_order_views'
+     ) AS exists`
+  );
+  return Boolean(rows[0]?.exists);
+}
+
+function revenueExpression(columns, alias = "") {
+  const prefix = alias ? `${alias}.` : "";
+  const hasFinalTotal = columns.has("final_total");
+  const hasTotalAmount = columns.has("total_amount");
+
+  if (hasFinalTotal && hasTotalAmount) {
+    return `COALESCE(${prefix}final_total, ${prefix}total_amount)`;
+  }
+  if (hasFinalTotal) return `${prefix}final_total`;
+  if (hasTotalAmount) return `${prefix}total_amount`;
+  return "0";
+}
+
+function shipmentPredicate(columns, alias = "") {
+  const prefix = alias ? `${alias}.` : "";
+  const hasWaybill = columns.has("waybill");
+  const hasShipmentStatus = columns.has("shipment_status");
+
+  if (hasWaybill && hasShipmentStatus) {
+    return `COALESCE(NULLIF(TRIM(${prefix}waybill), ''), NULL) IS NOT NULL
+            OR LOWER(COALESCE(${prefix}shipment_status, '')) NOT IN ('', 'not created')`;
+  }
+  if (hasWaybill) {
+    return `COALESCE(NULLIF(TRIM(${prefix}waybill), ''), NULL) IS NOT NULL`;
+  }
+  if (hasShipmentStatus) {
+    return `LOWER(COALESCE(${prefix}shipment_status, '')) NOT IN ('', 'not created')`;
+  }
+  return "FALSE";
+}
+
+function paidDateExpression(columns, alias = "") {
+  const prefix = alias ? `${alias}.` : "";
+  if (columns.has("payment_date")) return `${prefix}payment_date`;
+  if (columns.has("created_at")) return `${prefix}created_at`;
+  return "NULL";
+}
+
+async function fetchDashboardStats({ adminId, from, to }) {
+  const columns = await readOrdersColumns();
+  const includeViews = await hasAdminOrderViewsTable();
   const params = [adminId, from, to];
-  const paidTestFilter = includeIsTestOrder
-    ? "AND COALESCE(is_test_order, FALSE) = FALSE"
-    : "";
   const unseenJoin = includeViews
     ? `LEFT JOIN admin_order_views aov
          ON aov.order_id = o.id
         AND aov.admin_id = $1`
     : "";
   const unseenPredicate = includeViews ? "aov.order_id IS NULL" : "FALSE";
+  const revenueExpr = revenueExpression(columns);
+  const paidDateExpr = paidDateExpression(columns);
+  const shipmentExpr = shipmentPredicate(columns);
+  const quantityExpr = columns.has("quantity") ? "quantity" : "0";
+  const orderStatusExpr = columns.has("order_status")
+    ? "COALESCE(order_status, '')"
+    : "''";
+  const paymentStatusExpr = columns.has("payment_status")
+    ? "COALESCE(payment_status, '')"
+    : "''";
+  const paidTestFilter = columns.has("is_test_order")
+    ? "AND COALESCE(is_test_order, FALSE) = FALSE"
+    : "";
 
   const { rows } = await query(
     `WITH order_rows AS (
@@ -77,17 +149,16 @@ async function fetchDashboardStats({ adminId, from, to, includeIsTestOrder = tru
        SELECT
          COUNT(*)::int AS total_orders,
          COUNT(*) FILTER (
-           WHERE LOWER(COALESCE(order_status, '')) IN ('new', 'pending')
+           WHERE LOWER(${orderStatusExpr}) IN ('new', 'pending')
          )::int AS new_orders,
          COUNT(*) FILTER (
-           WHERE COALESCE(payment_status, '') = 'Paid'
+           WHERE ${paymentStatusExpr} = 'Paid'
          )::int AS paid_orders,
          COUNT(*) FILTER (
-           WHERE COALESCE(payment_status, '') = 'Pending'
+           WHERE ${paymentStatusExpr} = 'Pending'
          )::int AS pending_payments,
          COUNT(*) FILTER (
-           WHERE COALESCE(NULLIF(TRIM(waybill), ''), NULL) IS NOT NULL
-              OR LOWER(COALESCE(shipment_status, '')) NOT IN ('', 'not created')
+           WHERE ${shipmentExpr}
          )::int AS shipments_created,
          COUNT(*) FILTER (
            WHERE ${unseenPredicate}
@@ -97,43 +168,43 @@ async function fetchDashboardStats({ adminId, from, to, includeIsTestOrder = tru
      paid_orders AS (
        SELECT *
        FROM orders
-       WHERE payment_status = 'Paid'
-         AND COALESCE(order_status, '') <> 'Cancelled'
+       WHERE ${paymentStatusExpr} = 'Paid'
+         AND ${orderStatusExpr} <> 'Cancelled'
          ${paidTestFilter}
      ),
      sales AS (
        SELECT
-         COALESCE(SUM(quantity), 0)::int AS devices_sold,
-         COALESCE(SUM(COALESCE(final_total, total_amount)), 0)::numeric(12,2) AS revenue_received,
+         COALESCE(SUM(${quantityExpr}), 0)::int AS devices_sold,
+         COALESCE(SUM(${revenueExpr}), 0)::numeric(12,2) AS revenue_received,
          COALESCE(
-           SUM(quantity) FILTER (
-             WHERE payment_date IS NOT NULL
-               AND payment_date >= date_trunc('day', CURRENT_TIMESTAMP)
-               AND payment_date < date_trunc('day', CURRENT_TIMESTAMP) + INTERVAL '1 day'
+           SUM(${quantityExpr}) FILTER (
+             WHERE ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= date_trunc('day', CURRENT_TIMESTAMP)
+               AND ${paidDateExpr} < date_trunc('day', CURRENT_TIMESTAMP) + INTERVAL '1 day'
            ),
            0
          )::int AS today_devices_sold,
          COALESCE(
-           SUM(COALESCE(final_total, total_amount)) FILTER (
-             WHERE payment_date IS NOT NULL
-               AND payment_date >= date_trunc('day', CURRENT_TIMESTAMP)
-               AND payment_date < date_trunc('day', CURRENT_TIMESTAMP) + INTERVAL '1 day'
+           SUM(${revenueExpr}) FILTER (
+             WHERE ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= date_trunc('day', CURRENT_TIMESTAMP)
+               AND ${paidDateExpr} < date_trunc('day', CURRENT_TIMESTAMP) + INTERVAL '1 day'
            ),
            0
          )::numeric(12,2) AS today_revenue,
          COALESCE(
-           SUM(quantity) FILTER (
-             WHERE payment_date IS NOT NULL
-               AND payment_date >= date_trunc('month', CURRENT_TIMESTAMP)
-               AND payment_date < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'
+           SUM(${quantityExpr}) FILTER (
+             WHERE ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= date_trunc('month', CURRENT_TIMESTAMP)
+               AND ${paidDateExpr} < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'
            ),
            0
          )::int AS month_devices_sold,
          COALESCE(
-           SUM(COALESCE(final_total, total_amount)) FILTER (
-             WHERE payment_date IS NOT NULL
-               AND payment_date >= date_trunc('month', CURRENT_TIMESTAMP)
-               AND payment_date < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'
+           SUM(${revenueExpr}) FILTER (
+             WHERE ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= date_trunc('month', CURRENT_TIMESTAMP)
+               AND ${paidDateExpr} < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'
            ),
            0
          )::numeric(12,2) AS month_revenue
@@ -141,11 +212,11 @@ async function fetchDashboardStats({ adminId, from, to, includeIsTestOrder = tru
      ),
      analysis AS (
        SELECT
-         COALESCE(SUM(quantity), 0)::int AS analysis_devices_sold,
-         COALESCE(SUM(COALESCE(final_total, total_amount)), 0)::numeric(12,2) AS analysis_revenue_received
+         COALESCE(SUM(${quantityExpr}), 0)::int AS analysis_devices_sold,
+         COALESCE(SUM(${revenueExpr}), 0)::numeric(12,2) AS analysis_revenue_received
        FROM paid_orders
-       WHERE ($2::date IS NULL OR payment_date >= $2::date)
-         AND ($3::date IS NULL OR payment_date < ($3::date + INTERVAL '1 day'))
+       WHERE ($2::date IS NULL OR ${paidDateExpr} >= $2::date)
+         AND ($3::date IS NULL OR ${paidDateExpr} < ($3::date + INTERVAL '1 day'))
      )
      SELECT
        operational.*,
@@ -190,8 +261,6 @@ export async function getStats(req, res) {
       adminId,
       from,
       to,
-      includeIsTestOrder: true,
-      includeViews: true,
     });
 
     if (!stats) {
@@ -222,52 +291,6 @@ export async function getStats(req, res) {
       message: error?.message,
       code: error?.code,
     });
-
-    const missingIsTestOrder =
-      error?.code === "42703" &&
-      String(error?.message || "").includes("is_test_order");
-    const missingOrderViews =
-      error?.code === "42P01" &&
-      String(error?.message || "").includes("admin_order_views");
-
-    if (missingIsTestOrder || missingOrderViews) {
-      try {
-        const stats = await fetchDashboardStats({
-          adminId,
-          from,
-          to,
-          includeIsTestOrder: !missingIsTestOrder,
-          includeViews: !missingOrderViews,
-        });
-
-        return res.status(200).json({
-          success: true,
-          ...(stats
-            ? mapStatsRow(stats, from, to)
-            : {
-                totalOrders: 0,
-                newOrders: 0,
-                paidOrders: 0,
-                pendingPayments: 0,
-                shipmentsCreated: 0,
-                unseenOrders: 0,
-                devicesSold: 0,
-                revenueReceived: 0,
-                todayDevicesSold: 0,
-                todayRevenue: 0,
-                monthDevicesSold: 0,
-                monthRevenue: 0,
-                analysis: emptyAnalysis(from, to),
-              }),
-        });
-      } catch (fallbackError) {
-        console.error("Dashboard stats fallback error:", {
-          message: fallbackError?.message,
-          code: fallbackError?.code,
-        });
-      }
-    }
-
     return res.status(500).json({
       success: false,
       message: "Internal server error",
