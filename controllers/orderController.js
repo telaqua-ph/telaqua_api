@@ -128,15 +128,59 @@ function parseOrderId(raw) {
   return id;
 }
 
+function currentAdminId(req) {
+  const id = Number(req.user?.admin_id ?? req.user?.id);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 /** GET /api/orders */
 export async function listOrders(req, res) {
+  const adminId = currentAdminId(req);
+  if (!adminId) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
+  }
+
   try {
-    const { rows } = await query(
-      `SELECT *
-       FROM orders
-       ORDER BY created_at DESC
-       LIMIT 100`
-    );
+    let rows;
+    try {
+      const result = await query(
+        `SELECT
+           o.*,
+           (aov.order_id IS NOT NULL) AS is_seen,
+           aov.first_viewed_at,
+           aov.last_viewed_at
+         FROM orders o
+         LEFT JOIN admin_order_views aov
+           ON aov.order_id = o.id
+          AND aov.admin_id = $1
+         ORDER BY o.created_at DESC
+         LIMIT 100`,
+        [adminId]
+      );
+      rows = result.rows;
+    } catch (joinError) {
+      if (
+        joinError?.code === "42P01" &&
+        String(joinError?.message || "").includes("admin_order_views")
+      ) {
+        const fallback = await query(
+          `SELECT
+             o.*,
+             FALSE AS is_seen,
+             NULL::timestamptz AS first_viewed_at,
+             NULL::timestamptz AS last_viewed_at
+           FROM orders o
+           ORDER BY o.created_at DESC
+           LIMIT 100`
+        );
+        rows = fallback.rows;
+      } else {
+        throw joinError;
+      }
+    }
 
     return res.status(200).json({
       success: true,
@@ -148,6 +192,67 @@ export async function listOrders(req, res) {
       code: error?.code,
     });
     console.error("Orders API error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+}
+
+/** POST /api/orders/:id/mark-seen */
+export async function markOrderSeen(req, res) {
+  const adminId = currentAdminId(req);
+  if (!adminId) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
+  }
+
+  try {
+    const id = parseOrderId(req.params.id);
+    if (id === null) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid order id",
+      });
+    }
+
+    const { rows: orderRows } = await query(
+      `SELECT id FROM orders WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    if (!orderRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    await query(
+      `INSERT INTO admin_order_views (
+         admin_id, order_id, first_viewed_at, last_viewed_at
+       ) VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (admin_id, order_id)
+       DO UPDATE SET last_viewed_at = CURRENT_TIMESTAMP`,
+      [adminId, id]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Order marked as seen",
+    });
+  } catch (error) {
+    if (
+      error?.code === "42P01" &&
+      String(error?.message || "").includes("admin_order_views")
+    ) {
+      return res.status(503).json({
+        success: false,
+        message: "Order view tracking table missing. Run sql/add_order_views.sql",
+      });
+    }
+    console.error("Mark order seen API error:", error);
     return res.status(500).json({
       success: false,
       message: "Internal server error",
