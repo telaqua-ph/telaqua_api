@@ -193,6 +193,14 @@ export async function handleRazorpayWebhook(req, res) {
       return res.status(400).json({ success: false, message: "Payment details do not match order" });
     }
 
+    if (result.status === "insufficient_stock") {
+      return res.status(409).json({
+        success: false,
+        message: "Insufficient stock to confirm order",
+        available: result.available,
+      });
+    }
+
     if (result.status === "ineligible") {
       return res.status(400).json({ success: false, message: "Order is not eligible for payment confirmation" });
     }

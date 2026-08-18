@@ -25,6 +25,7 @@ import {
   ensureWhatsappConsentColumns,
   parseWhatsappConsent,
 } from "../services/whatsappConsent.js";
+import { assertStockAvailable } from "../services/inventoryService.js";
 import {
   ensureSwipeInvoiceForPaidOrder,
   getOrderInvoicePdfByOrderId,
@@ -872,6 +873,15 @@ export async function createPaymentOrder(req, res) {
       });
     }
 
+    const stockCheck = await assertStockAvailable(orderData.quantity);
+    if (!stockCheck.ok) {
+      return res.status(409).json({
+        success: false,
+        message: stockCheck.message,
+        available: stockCheck.available,
+      });
+    }
+
     try {
       await ensureWhatsappConsentColumns();
     } catch (colErr) {
@@ -1520,6 +1530,14 @@ export async function verifyPayment(req, res) {
       return res.status(409).json({
         success: false,
         message: "We could not verify this payment yet. Please check your order status.",
+      });
+    }
+
+    if (result.status === "insufficient_stock") {
+      return res.status(409).json({
+        success: false,
+        message: "Payment received but stock is unavailable. Our team will contact you shortly.",
+        available: result.available,
       });
     }
 

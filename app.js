@@ -22,6 +22,7 @@ import dashboardRoutes from "./routes/dashboard.js";
 import deliveryRoutes from "./routes/delivery.js";
 import promoRoutes from "./routes/promo.js";
 import promoCodesRoutes from "./routes/promoCodes.js";
+import inventoryRoutes from "./routes/inventory.js";
 import { handleSwipeWebhook } from "./controllers/swipeWebhookController.js";
 import { handleRazorpayWebhook } from "./controllers/razorpayWebhookController.js";
 
@@ -139,6 +140,7 @@ app.use("/api/payment", paymentRoutes);
 app.use("/api/test/razorpay", testRazorpayRoutes);
 app.use("/api/promo", promoRoutes);
 app.use("/api/promo-codes", promoCodesRoutes);
+app.use("/api/inventory", inventoryRoutes);
 app.use("/api/contact", contactRoutes);
 app.use("/api/customers", customersRoutes);
 app.use("/api/customer", customerAccountRoutes);

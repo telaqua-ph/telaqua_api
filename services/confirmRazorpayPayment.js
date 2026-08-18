@@ -7,6 +7,10 @@ import { pool, query } from "../config/db.js";
 import { getRazorpayClient } from "../config/razorpay.js";
 import { incrementPromoUsedCount } from "./promoService.js";
 import { processOrderFulfillment } from "./invoiceService.js";
+import {
+  deductStockForSale,
+  dispatchInventoryAlertEmails,
+} from "./inventoryService.js";
 
 export function logPaymentEvent(code, extra = {}) {
   const payload = {
@@ -178,6 +182,7 @@ export async function confirmCapturedRazorpayPayment({
 
   const client = await pool.connect();
   let newlyPaid = null;
+  let inventoryEmails = [];
   try {
     await client.query("BEGIN");
 
@@ -281,6 +286,7 @@ export async function confirmCapturedRazorpayPayment({
          RETURNING
            id,
            order_number,
+           quantity,
            promo_code,
            payment_status,
            order_status,
@@ -306,6 +312,7 @@ export async function confirmCapturedRazorpayPayment({
            RETURNING
              id,
              order_number,
+             quantity,
              promo_code,
              payment_status,
              order_status,
@@ -338,6 +345,42 @@ export async function confirmCapturedRazorpayPayment({
     }
 
     newlyPaid = updated.rows[0];
+
+    try {
+      const stockResult = await deductStockForSale(client, {
+        orderId: newlyPaid.id,
+        orderNumber: newlyPaid.order_number,
+        quantity: newlyPaid.quantity,
+        isTestOrder: newlyPaid.is_test_order,
+      });
+
+      if (stockResult.status === "insufficient_stock") {
+        await client.query("ROLLBACK");
+        logPaymentEvent("INVENTORY_INSUFFICIENT", {
+          orderId: newlyPaid.id,
+          orderNumber: newlyPaid.order_number,
+          quantity: newlyPaid.quantity,
+          available: stockResult.available,
+        });
+        return {
+          status: "insufficient_stock",
+          order: newlyPaid,
+          available: stockResult.available,
+        };
+      }
+
+      inventoryEmails = stockResult.pendingEmails || [];
+    } catch (invErr) {
+      if (invErr?.code === "42P01") {
+        console.warn(
+          "Inventory tables missing during payment confirm; run sql/add_inventory.sql"
+        );
+      } else {
+        await client.query("ROLLBACK").catch(() => {});
+        throw invErr;
+      }
+    }
+
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
@@ -395,6 +438,10 @@ export async function confirmCapturedRazorpayPayment({
     razorpayOrderId: orderIdKey,
     razorpayPaymentId: paymentId,
   });
+
+  if (inventoryEmails.length) {
+    dispatchInventoryAlertEmails(inventoryEmails);
+  }
 
   return { status: "marked_paid", order: newlyPaid };
 }

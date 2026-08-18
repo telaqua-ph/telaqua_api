@@ -11,6 +11,11 @@ import {
   parseWhatsappConsent,
 } from "../services/whatsappConsent.js";
 import { logPaymentEvent, reconcileRazorpayOrder } from "../services/confirmRazorpayPayment.js";
+import {
+  dispatchInventoryAlertEmails,
+  restoreStockForCancellation,
+} from "../services/inventoryService.js";
+import { pool } from "../config/db.js";
 
 const ALLOWED_ORDER_STATUSES = [
   "New",
@@ -481,7 +486,8 @@ export async function updateOrder(req, res) {
     }
 
     const { rows: existing } = await query(
-      `SELECT id FROM orders WHERE id = $1`,
+      `SELECT id, order_status, payment_status, quantity, order_number
+       FROM orders WHERE id = $1`,
       [id]
     );
 
@@ -492,22 +498,58 @@ export async function updateOrder(req, res) {
       });
     }
 
-    const { rows } = await query(
-      `UPDATE orders
-       SET
-         order_status = COALESCE($1, order_status),
-         payment_status = COALESCE($2, payment_status),
-         updated_at = CURRENT_TIMESTAMP
-       WHERE id = $3
-       RETURNING *`,
-      [order_status ?? null, payment_status ?? null, id]
-    );
+    const prior = existing[0];
+    const nextOrderStatus = order_status ?? prior.order_status;
+    const nextPaymentStatus = payment_status ?? prior.payment_status;
+    const isCancelling =
+      nextOrderStatus === "Cancelled" && prior.order_status !== "Cancelled";
 
-    return res.status(200).json({
-      success: true,
-      message: "Order updated successfully",
-      order: rows[0],
-    });
+    const client = await pool.connect();
+    let inventoryEmails = [];
+    try {
+      await client.query("BEGIN");
+
+      const { rows } = await client.query(
+        `UPDATE orders
+         SET
+           order_status = COALESCE($1, order_status),
+           payment_status = COALESCE($2, payment_status),
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3
+         RETURNING *`,
+        [order_status ?? null, payment_status ?? null, id]
+      );
+
+      if (
+        isCancelling &&
+        (prior.payment_status === "Paid" || nextPaymentStatus === "Paid")
+      ) {
+        const restoreResult = await restoreStockForCancellation(client, {
+          orderId: prior.id,
+          orderNumber: prior.order_number,
+          quantity: prior.quantity,
+          adminId: Number(req.user?.admin_id) || null,
+        });
+        inventoryEmails = restoreResult.pendingEmails || [];
+      }
+
+      await client.query("COMMIT");
+
+      if (inventoryEmails.length) {
+        dispatchInventoryAlertEmails(inventoryEmails);
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Order updated successfully",
+        order: rows[0],
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
   } catch (error) {
     console.error("Order by id API error:", error);
     return res.status(500).json({
