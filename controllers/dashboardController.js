@@ -108,6 +108,9 @@ function shipmentPredicate(columns, alias = "") {
 
 function paidDateExpression(columns, alias = "") {
   const prefix = alias ? `${alias}.` : "";
+  if (columns.has("payment_date") && columns.has("created_at")) {
+    return `COALESCE(${prefix}payment_date, ${prefix}created_at)`;
+  }
   if (columns.has("payment_date")) return `${prefix}payment_date`;
   if (columns.has("created_at")) return `${prefix}created_at`;
   return "NULL";
@@ -122,7 +125,7 @@ async function fetchDashboardStats({ adminId, from, to }) {
          ON aov.order_id = o.id
         AND aov.admin_id = $1`
     : "";
-  const unseenPredicate = includeViews ? "aov.order_id IS NULL" : "FALSE";
+  const unseenPredicate = includeViews ? "is_seen = FALSE" : "FALSE";
   const revenueExpr = revenueExpression(columns);
   const paidDateExpr = paidDateExpression(columns);
   const shipmentExpr = shipmentPredicate(columns);
