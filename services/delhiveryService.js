@@ -1,8 +1,11 @@
 /**
  * services/delhiveryService.js
  *
- * Delhivery B2C — shipment creation only.
+ * Delhivery B2C — shipment creation only (CMU create.json).
  * Token and URLs come from process.env — never hardcoded or fully logged.
+ *
+ * Tel-Aqua does NOT implement pickup request, label, or tracking APIs.
+ * After create, operators continue in Delhivery One. See docs/DELHIVERY_FLOW.md
  */
 
 function getDelhiveryApiToken() {

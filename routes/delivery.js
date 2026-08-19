@@ -1,7 +1,9 @@
 /**
  * routes/delivery.js
  *
- * Delhivery shipment creation only.
+ * Delhivery B2C — shipment creation only (CMU create.json).
+ * Pickup, labels, and Ready for Pickup are handled in Delhivery One — not here.
+ * See docs/DELHIVERY_FLOW.md
  */
 
 import { Router } from "express";

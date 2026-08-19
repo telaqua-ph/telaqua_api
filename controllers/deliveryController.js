@@ -1,8 +1,9 @@
 /**
  * controllers/deliveryController.js
  *
- * Delhivery shipment creation only:
- * load an existing Neon order, create a Delhivery shipment, save AWB.
+ * Delhivery shipment creation only (CMU create.json).
+ * Pickup / Ready for Pickup / labels / tracking happen in Delhivery One.
+ * See docs/DELHIVERY_FLOW.md
  */
 
 import { createShipment } from "../services/delhiveryService.js";
@@ -416,6 +417,20 @@ function existingOrderAwb(order) {
   return null;
 }
 
+function isOrderShipmentAlreadyCreated(order) {
+  if (existingOrderAwb(order)) return true;
+  const shipmentId = String(order?.delhivery_shipment_id || "").trim();
+  if (shipmentId) return true;
+  const status = String(order?.shipment_status || "")
+    .trim()
+    .toLowerCase();
+  if (!status || status === "not created" || status.startsWith("not ")) {
+    return false;
+  }
+  if (status.includes("fail") || status.includes("error")) return false;
+  return status === "created" || status.includes("created");
+}
+
 function safeDelhiveryResponseSnapshot(data) {
   if (!data || typeof data !== "object") {
     return { type: typeof data };
@@ -643,7 +658,7 @@ export async function createShipmentForOrder(req, res) {
     }
 
     const alreadyAwb = existingOrderAwb(order);
-    if (alreadyAwb) {
+    if (isOrderShipmentAlreadyCreated(order)) {
       return res.status(200).json({
         success: true,
         message: "Shipment already created",
@@ -652,6 +667,8 @@ export async function createShipmentForOrder(req, res) {
         order_id: order.id,
         order_number: order.order_number,
         shipment_status: order.shipment_status || "Created",
+        delhivery_shipment_id: order.delhivery_shipment_id || null,
+        shipment_created_at: order.shipment_created_at || null,
       });
     }
 
