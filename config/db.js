@@ -1,58 +1,122 @@
 /**
  * config/db.js
  *
- * PostgreSQL connection pool (Neon / any Postgres).
- * Uses process.env.DATABASE_URL — never hardcode credentials.
+ * Hostinger MySQL connection pool (mysql2/promise).
+ * Uses DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD — never hardcode credentials.
  *
- * Important for Hostinger: missing DATABASE_URL must not crash the
- * HTTP server at import time. Health routes still work; DB routes fail
- * with a clear error when queried.
+ * Exposes a pg-compatible query() result shape { rows, rowCount, insertId }
+ * and pool.connect() for transactions (BEGIN/COMMIT/ROLLBACK translated).
  */
 
-import pg from "pg";
+import mysql from "mysql2/promise";
 
-const { Pool } = pg;
+const dbHost = (process.env.DB_HOST || "").trim();
+const dbName = (process.env.DB_NAME || "").trim();
+const dbUser = (process.env.DB_USER || "").trim();
+const dbPassword = process.env.DB_PASSWORD ?? "";
 
-const databaseUrl = (process.env.DATABASE_URL || "").trim();
+const databaseConfigured = Boolean(dbHost && dbName && dbUser);
 
-if (!databaseUrl) {
+if (!databaseConfigured) {
   console.warn(
-    "Warning: DATABASE_URL is not set. Database queries will fail until it is configured."
+    "Warning: MySQL is not fully configured (DB_HOST, DB_NAME, DB_USER). Database queries will fail until set."
   );
 }
 
-const pool = new Pool({
-  connectionString: databaseUrl || undefined,
-  // Neon and most cloud Postgres require SSL when a URL is present
-  ssl: databaseUrl ? { rejectUnauthorized: false } : undefined,
-  // Keep idle clients from holding connections forever on PaaS
-  max: Number(process.env.DB_POOL_MAX) || 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
+const mysqlPool = mysql.createPool({
+  host: dbHost || undefined,
+  port: Number(process.env.DB_PORT || 3306),
+  database: dbName || undefined,
+  user: dbUser || undefined,
+  password: dbPassword,
+  waitForConnections: true,
+  connectionLimit: Number(process.env.DB_POOL_MAX) || 10,
+  queueLimit: 0,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0,
 });
 
-// Without this listener, idle client errors can crash the Node process (503 on Hostinger)
-pool.on("error", (err) => {
-  console.error("Unexpected PostgreSQL pool error:", {
-    message: err?.message,
-    code: err?.code,
-  });
-});
+function normalizeExecuteResult(result) {
+  if (Array.isArray(result)) {
+    return {
+      rows: result,
+      rowCount: result.length,
+    };
+  }
+  return {
+    rows: [],
+    rowCount: result.affectedRows ?? 0,
+    insertId: result.insertId,
+  };
+}
+
+async function executeOn(connection, sql, params = []) {
+  const [result] = await connection.execute(sql, params);
+  return normalizeExecuteResult(result);
+}
+
+function wrapConnection(rawConnection) {
+  return {
+    async query(sql, params = []) {
+      const trimmed = String(sql || "").trim().toUpperCase();
+      if (trimmed === "BEGIN" || trimmed === "START TRANSACTION") {
+        await rawConnection.beginTransaction();
+        return { rows: [], rowCount: 0 };
+      }
+      if (trimmed === "COMMIT") {
+        await rawConnection.commit();
+        return { rows: [], rowCount: 0 };
+      }
+      if (trimmed === "ROLLBACK") {
+        await rawConnection.rollback();
+        return { rows: [], rowCount: 0 };
+      }
+      return executeOn(rawConnection, sql, params);
+    },
+    release() {
+      rawConnection.release();
+    },
+    /** Direct mysql2 connection for advanced use */
+    _raw: rawConnection,
+  };
+}
 
 /**
  * Run a parameterized SQL query.
  * @param {string} text
  * @param {any[]} [params]
- * @returns {Promise<pg.QueryResult>}
  */
 export async function query(text, params = []) {
-  if (!databaseUrl) {
-    const err = new Error("DATABASE_URL is not configured");
+  if (!databaseConfigured) {
+    const err = new Error("MySQL database is not configured");
     err.code = "DB_CONFIG_ERROR";
     throw err;
   }
-
-  return pool.query(text, params);
+  const [result] = await mysqlPool.execute(text, params);
+  return normalizeExecuteResult(result);
 }
 
-export { pool };
+/** pg-compatible pool facade */
+export const pool = {
+  async connect() {
+    if (!databaseConfigured) {
+      const err = new Error("MySQL database is not configured");
+      err.code = "DB_CONFIG_ERROR";
+      throw err;
+    }
+    const conn = await mysqlPool.getConnection();
+    return wrapConnection(conn);
+  },
+  async query(text, params = []) {
+    return query(text, params);
+  },
+  async end() {
+    await mysqlPool.end();
+  },
+  /** Underlying mysql2 pool */
+  _mysql: mysqlPool,
+};
+
+export function isDatabaseConfigured() {
+  return databaseConfigured;
+}

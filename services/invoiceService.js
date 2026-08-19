@@ -20,14 +20,14 @@ const ORDER_SELECT = `
     quantity, unit_price, total_amount, payment_method, payment_status,
     order_status, order_number, razorpay_order_id, razorpay_payment_id,
     payment_date, promo_code, original_amount, discount_amount,
-    COALESCE(is_test_order, FALSE) AS is_test_order,
+    COALESCE(is_test_order, 0) AS is_test_order,
     subtotal, taxable_amount, gst_amount, gst_rate, shipping_amount,
     final_total, invoice_number, invoice_url, invoice_generated_at,
     invoice_status, invoice_processing_started_at, invoice_attempt_token,
     swipe_invoice_id, swipe_invoice_error, whatsapp_invoice_status,
     whatsapp_invoice_message_id, whatsapp_invoice_sent_at,
     whatsapp_invoice_error, whatsapp_updates_consent, whatsapp_consent_at
-  FROM orders WHERE id = $1 LIMIT 1
+  FROM orders WHERE id = ? LIMIT 1
 `;
 
 export async function loadOrderForFulfillment(orderId) {
@@ -189,24 +189,23 @@ function existingInvoice(order) {
 
 async function claimInvoiceCreation(orderId) {
   const token = crypto.randomUUID();
-  const { rows } = await query(
+  const { rowCount } = await query(
     `UPDATE orders
-     SET invoice_status = 'pending', invoice_attempt_token = $2,
+     SET invoice_status = 'pending', invoice_attempt_token = ?,
          invoice_processing_started_at = CURRENT_TIMESTAMP,
          swipe_invoice_error = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1 AND payment_status = 'Paid' AND swipe_invoice_id IS NULL
+     WHERE id = ? AND payment_status = 'Paid' AND swipe_invoice_id IS NULL
        AND (
          invoice_status IS NULL
          OR LOWER(invoice_status) IN ('not_created', 'not created', 'failed')
          OR (LOWER(invoice_status) = 'pending' AND (
              invoice_processing_started_at IS NULL
-             OR invoice_processing_started_at < NOW() - INTERVAL '5 minutes'
+             OR invoice_processing_started_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE)
          ))
-       )
-     RETURNING id`,
-    [orderId, token]
+       )`,
+    [token, orderId]
   );
-  return rows.length ? token : null;
+  return rowCount ? token : null;
 }
 
 export async function ensureSwipeInvoiceForPaidOrder(orderId) {
@@ -230,7 +229,7 @@ export async function ensureSwipeInvoiceForPaidOrder(orderId) {
            invoice_generated_at = COALESCE(invoice_generated_at, CURRENT_TIMESTAMP),
            swipe_invoice_error = NULL, invoice_attempt_token = NULL,
            invoice_processing_started_at = NULL, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
+         WHERE id = ?`,
         [order.id]
       );
       order = await loadOrderForFulfillment(order.id);
@@ -263,18 +262,22 @@ export async function ensureSwipeInvoiceForPaidOrder(orderId) {
       }
     }
 
-    const { rows } = await query(
-      `UPDATE orders SET invoice_number = $1, invoice_url = $2,
+    await query(
+      `UPDATE orders SET invoice_number = ?, invoice_url = ?,
          invoice_generated_at = CURRENT_TIMESTAMP, invoice_status = 'generated',
-         swipe_invoice_id = $3, swipe_invoice_error = NULL,
+         swipe_invoice_id = ?, swipe_invoice_error = NULL,
          invoice_attempt_token = NULL, invoice_processing_started_at = NULL,
          whatsapp_invoice_status = CASE
-           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, FALSE)
+           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, 0)
              THEN 'pending' ELSE 'not_applicable' END,
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4 AND invoice_attempt_token = $5 AND swipe_invoice_id IS NULL
-       RETURNING invoice_number, invoice_url, invoice_generated_at, swipe_invoice_id`,
+       WHERE id = ? AND invoice_attempt_token = ? AND swipe_invoice_id IS NULL`,
       [serialNumber, `/api/orders/${order.id}/invoice/download`, hashId, order.id, attemptToken]
+    );
+    const { rows } = await query(
+      `SELECT invoice_number, invoice_url, invoice_generated_at, swipe_invoice_id
+       FROM orders WHERE id = ? AND swipe_invoice_id = ? LIMIT 1`,
+      [order.id, hashId]
     );
     if (!rows.length) throw new Error("Invoice claim was lost before it could be saved");
     const confirmed = await loadOrderForFulfillment(order.id);
@@ -290,17 +293,17 @@ export async function ensureSwipeInvoiceForPaidOrder(orderId) {
   } catch (error) {
     const safeError = String(error?.message || "Swipe invoice creation failed").slice(0, 1000);
     await query(
-      `UPDATE orders SET invoice_status = 'failed', swipe_invoice_error = $3,
+      `UPDATE orders SET invoice_status = 'failed', swipe_invoice_error = ?,
          invoice_attempt_token = NULL, invoice_processing_started_at = NULL,
          whatsapp_invoice_status = CASE
-           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, FALSE)
+           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, 0)
              THEN 'failed' ELSE 'not_applicable' END,
          whatsapp_invoice_error = CASE
-           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, FALSE)
-             THEN $3 ELSE NULL END,
+           WHEN whatsapp_updates_consent AND NOT COALESCE(is_test_order, 0)
+             THEN ? ELSE NULL END,
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1 AND invoice_attempt_token = $2`,
-      [order.id, attemptToken, safeError]
+       WHERE id = ? AND invoice_attempt_token = ?`,
+      [safeError, safeError, order.id, attemptToken]
     ).catch(() => {});
     console.error(`Swipe invoice creation failed for ${order.order_number || order.id}`, { message: safeError });
     const wrapped = new Error("Swipe invoice creation failed");

@@ -5,7 +5,7 @@
  * Consent is stored only when the order row is inserted — never earlier.
  */
 
-import { query } from "../config/db.js";
+import { ensureColumn } from "../lib/schemaHelpers.js";
 
 let whatsappColumnsReady = false;
 
@@ -22,13 +22,16 @@ const CONSENT_KEYS = [
  */
 export async function ensureWhatsappConsentColumns() {
   if (whatsappColumnsReady) return;
-  await query(
+  await ensureColumn(
+    "orders",
+    "whatsapp_updates_consent",
     `ALTER TABLE orders
-     ADD COLUMN IF NOT EXISTS whatsapp_updates_consent BOOLEAN NOT NULL DEFAULT FALSE`
+     ADD COLUMN whatsapp_updates_consent TINYINT(1) NOT NULL DEFAULT 0`
   );
-  await query(
-    `ALTER TABLE orders
-     ADD COLUMN IF NOT EXISTS whatsapp_consent_at TIMESTAMP NULL`
+  await ensureColumn(
+    "orders",
+    "whatsapp_consent_at",
+    `ALTER TABLE orders ADD COLUMN whatsapp_consent_at DATETIME NULL`
   );
   whatsappColumnsReady = true;
 }

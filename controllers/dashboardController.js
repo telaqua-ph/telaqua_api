@@ -55,24 +55,22 @@ function mapStatsRow(row, from, to) {
 
 async function readOrdersColumns() {
   const { rows } = await query(
-    `SELECT column_name
-     FROM information_schema.columns
-     WHERE table_schema = 'public'
-       AND table_name = 'orders'`
+    `SELECT COLUMN_NAME AS column_name
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'orders'`
   );
   return new Set(rows.map((row) => row.column_name));
 }
 
 async function hasAdminOrderViewsTable() {
   const { rows } = await query(
-    `SELECT EXISTS (
-       SELECT 1
-       FROM information_schema.tables
-       WHERE table_schema = 'public'
-         AND table_name = 'admin_order_views'
-     ) AS exists`
+    `SELECT COUNT(*) AS cnt
+     FROM information_schema.TABLES
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'admin_order_views'`
   );
-  return Boolean(rows[0]?.exists);
+  return Number(rows[0]?.cnt || 0) > 0;
 }
 
 function revenueExpression(columns, alias = "") {
@@ -123,9 +121,9 @@ async function fetchDashboardStats({ adminId, from, to }) {
   const unseenJoin = includeViews
     ? `LEFT JOIN admin_order_views aov
          ON aov.order_id = o.id
-        AND aov.admin_id = $1`
+        AND aov.admin_id = ?`
     : "";
-  const unseenPredicate = includeViews ? "is_seen = FALSE" : "FALSE";
+  const unseenPredicate = includeViews ? "is_seen = 0" : "FALSE";
   const revenueExpr = revenueExpression(columns);
   const paidDateExpr = paidDateExpression(columns);
   const shipmentExpr = shipmentPredicate(columns);
@@ -137,35 +135,25 @@ async function fetchDashboardStats({ adminId, from, to }) {
     ? "COALESCE(payment_status, '')"
     : "''";
   const paidTestFilter = columns.has("is_test_order")
-    ? "AND COALESCE(is_test_order, FALSE) = FALSE"
+    ? "AND COALESCE(is_test_order, 0) = 0"
     : "";
 
   const { rows } = await query(
     `WITH order_rows AS (
        SELECT
          o.*,
-         ${includeViews ? "aov.first_viewed_at IS NOT NULL" : "FALSE"} AS is_seen
+         ${includeViews ? "aov.first_viewed_at IS NOT NULL" : "0"} AS is_seen
        FROM orders o
        ${unseenJoin}
      ),
      operational AS (
        SELECT
-         COUNT(*)::int AS total_orders,
-         COUNT(*) FILTER (
-           WHERE LOWER(${orderStatusExpr}) IN ('new', 'pending')
-         )::int AS new_orders,
-         COUNT(*) FILTER (
-           WHERE ${paymentStatusExpr} = 'Paid'
-         )::int AS paid_orders,
-         COUNT(*) FILTER (
-           WHERE ${paymentStatusExpr} = 'Pending'
-         )::int AS pending_payments,
-         COUNT(*) FILTER (
-           WHERE ${shipmentExpr}
-         )::int AS shipments_created,
-         COUNT(*) FILTER (
-           WHERE ${unseenPredicate}
-         )::int AS unseen_orders
+         CAST(COUNT(*) AS SIGNED) AS total_orders,
+         CAST(SUM(CASE WHEN LOWER(${orderStatusExpr}) IN ('new', 'pending') THEN 1 ELSE 0 END) AS SIGNED) AS new_orders,
+         CAST(SUM(CASE WHEN ${paymentStatusExpr} = 'Paid' THEN 1 ELSE 0 END) AS SIGNED) AS paid_orders,
+         CAST(SUM(CASE WHEN ${paymentStatusExpr} = 'Pending' THEN 1 ELSE 0 END) AS SIGNED) AS pending_payments,
+         CAST(SUM(CASE WHEN ${shipmentExpr} THEN 1 ELSE 0 END) AS SIGNED) AS shipments_created,
+         CAST(SUM(CASE WHEN ${unseenPredicate} THEN 1 ELSE 0 END) AS SIGNED) AS unseen_orders
        FROM order_rows o
      ),
      paid_orders AS (
@@ -177,64 +165,60 @@ async function fetchDashboardStats({ adminId, from, to }) {
      ),
      sales AS (
        SELECT
-         COALESCE(SUM(${quantityExpr}), 0)::int AS devices_sold,
-         COALESCE(SUM(${revenueExpr}), 0)::numeric(12,2) AS revenue_received,
-         COALESCE(
-           SUM(${quantityExpr}) FILTER (
-             WHERE ${paidDateExpr} IS NOT NULL
-               AND ${paidDateExpr} >= date_trunc('day', CURRENT_TIMESTAMP)
-               AND ${paidDateExpr} < date_trunc('day', CURRENT_TIMESTAMP) + INTERVAL '1 day'
-           ),
-           0
-         )::int AS today_devices_sold,
-         COALESCE(
-           SUM(${revenueExpr}) FILTER (
-             WHERE ${paidDateExpr} IS NOT NULL
-               AND ${paidDateExpr} >= date_trunc('day', CURRENT_TIMESTAMP)
-               AND ${paidDateExpr} < date_trunc('day', CURRENT_TIMESTAMP) + INTERVAL '1 day'
-           ),
-           0
-         )::numeric(12,2) AS today_revenue,
-         COALESCE(
-           SUM(${quantityExpr}) FILTER (
-             WHERE ${paidDateExpr} IS NOT NULL
-               AND ${paidDateExpr} >= date_trunc('month', CURRENT_TIMESTAMP)
-               AND ${paidDateExpr} < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'
-           ),
-           0
-         )::int AS month_devices_sold,
-         COALESCE(
-           SUM(${revenueExpr}) FILTER (
-             WHERE ${paidDateExpr} IS NOT NULL
-               AND ${paidDateExpr} >= date_trunc('month', CURRENT_TIMESTAMP)
-               AND ${paidDateExpr} < date_trunc('month', CURRENT_TIMESTAMP) + INTERVAL '1 month'
-           ),
-           0
-         )::numeric(12,2) AS month_revenue
+         CAST(COALESCE(SUM(${quantityExpr}), 0) AS SIGNED) AS devices_sold,
+         CAST(COALESCE(SUM(${revenueExpr}), 0) AS DECIMAL(12,2)) AS revenue_received,
+         CAST(COALESCE(
+           SUM(CASE
+             WHEN ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= CURDATE()
+               AND ${paidDateExpr} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+             THEN ${quantityExpr} ELSE 0 END),
+           0) AS SIGNED) AS today_devices_sold,
+         CAST(COALESCE(
+           SUM(CASE
+             WHEN ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= CURDATE()
+               AND ${paidDateExpr} < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+             THEN ${revenueExpr} ELSE 0 END),
+           0) AS DECIMAL(12,2)) AS today_revenue,
+         CAST(COALESCE(
+           SUM(CASE
+             WHEN ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= DATE_FORMAT(NOW(), '%Y-%m-01')
+               AND ${paidDateExpr} < DATE_ADD(DATE_FORMAT(NOW(), '%Y-%m-01'), INTERVAL 1 MONTH)
+             THEN ${quantityExpr} ELSE 0 END),
+           0) AS SIGNED) AS month_devices_sold,
+         CAST(COALESCE(
+           SUM(CASE
+             WHEN ${paidDateExpr} IS NOT NULL
+               AND ${paidDateExpr} >= DATE_FORMAT(NOW(), '%Y-%m-01')
+               AND ${paidDateExpr} < DATE_ADD(DATE_FORMAT(NOW(), '%Y-%m-01'), INTERVAL 1 MONTH)
+             THEN ${revenueExpr} ELSE 0 END),
+           0) AS DECIMAL(12,2)) AS month_revenue
        FROM paid_orders
      ),
      analysis AS (
        SELECT
-         COALESCE(SUM(${quantityExpr}), 0)::int AS analysis_devices_sold,
-         COALESCE(SUM(${revenueExpr}), 0)::numeric(12,2) AS analysis_revenue_received
+         CAST(COALESCE(SUM(${quantityExpr}), 0) AS SIGNED) AS analysis_devices_sold,
+         CAST(COALESCE(SUM(${revenueExpr}), 0) AS DECIMAL(12,2)) AS analysis_revenue_received
        FROM paid_orders
-       WHERE ($2::date IS NULL OR ${paidDateExpr} >= $2::date)
-         AND ($3::date IS NULL OR ${paidDateExpr} < ($3::date + INTERVAL '1 day'))
+       WHERE (? IS NULL OR ${paidDateExpr} >= ?)
+         AND (? IS NULL OR ${paidDateExpr} < DATE_ADD(?, INTERVAL 1 DAY))
      )
      SELECT
        operational.*,
        sales.*,
        analysis.analysis_devices_sold,
        analysis.analysis_revenue_received,
-       CASE
+       CAST(CASE
          WHEN analysis.analysis_devices_sold > 0
            THEN ROUND(analysis.analysis_revenue_received / analysis.analysis_devices_sold, 2)
          ELSE 0
-       END::numeric(12,2) AS analysis_average_revenue_per_device
+       END AS DECIMAL(12,2)) AS analysis_average_revenue_per_device
      FROM operational
      CROSS JOIN sales
      CROSS JOIN analysis`,
-    params
+    [adminId, from, from, to, to]
   );
 
   return rows[0] || null;

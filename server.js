@@ -7,6 +7,7 @@
 
 import "dotenv/config";
 import app from "./app.js";
+import { isDatabaseConfigured } from "./config/db.js";
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -17,7 +18,7 @@ function logSafeStartupInfo() {
     env: process.env.NODE_ENV || "development",
     host: HOST,
     port: PORT,
-    databaseConfigured: Boolean(process.env.DATABASE_URL),
+    databaseConfigured: isDatabaseConfigured(),
     jwtConfigured: Boolean(process.env.JWT_SECRET),
     razorpayConfigured: Boolean(
       process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET

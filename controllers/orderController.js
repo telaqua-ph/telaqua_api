@@ -5,6 +5,7 @@
  * Includes restored DELETE /api/orders/:id.
  */
 
+import { isMissingTableError } from "../lib/dbErrors.js";
 import { query } from "../config/db.js";
 import {
   ensureWhatsappConsentColumns,
@@ -155,7 +156,7 @@ export async function listOrders(req, res) {
          FROM orders o
          LEFT JOIN admin_order_views aov
            ON aov.order_id = o.id
-          AND aov.admin_id = $1
+          AND aov.admin_id = ?
          ORDER BY o.created_at DESC
          LIMIT 100`,
         [adminId]
@@ -163,15 +164,15 @@ export async function listOrders(req, res) {
       rows = result.rows;
     } catch (joinError) {
       if (
-        joinError?.code === "42P01" &&
+        joinError?.code === "ER_NO_SUCH_TABLE" &&
         String(joinError?.message || "").includes("admin_order_views")
       ) {
         const fallback = await query(
           `SELECT
              o.*,
-             FALSE AS is_seen,
-             NULL::timestamptz AS first_viewed_at,
-             NULL::timestamptz AS last_viewed_at
+             0 AS is_seen,
+             NULL AS first_viewed_at,
+             NULL AS last_viewed_at
            FROM orders o
            ORDER BY o.created_at DESC
            LIMIT 100`
@@ -219,7 +220,7 @@ export async function markOrderSeen(req, res) {
     }
 
     const { rows: orderRows } = await query(
-      `SELECT id FROM orders WHERE id = $1 LIMIT 1`,
+      `SELECT id FROM orders WHERE id = ? LIMIT 1`,
       [id]
     );
     if (!orderRows.length) {
@@ -232,9 +233,8 @@ export async function markOrderSeen(req, res) {
     await query(
       `INSERT INTO admin_order_views (
          admin_id, order_id, first_viewed_at, last_viewed_at
-       ) VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-       ON CONFLICT (admin_id, order_id)
-       DO UPDATE SET last_viewed_at = CURRENT_TIMESTAMP`,
+       ) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON DUPLICATE KEY UPDATE last_viewed_at = CURRENT_TIMESTAMP`,
       [adminId, id]
     );
 
@@ -244,7 +244,7 @@ export async function markOrderSeen(req, res) {
     });
   } catch (error) {
     if (
-      error?.code === "42P01" &&
+      error?.code === "ER_NO_SUCH_TABLE" &&
       String(error?.message || "").includes("admin_order_views")
     ) {
       return res.status(503).json({
@@ -343,7 +343,7 @@ export async function reconcilePendingRazorpayPayments(req, res) {
        FROM orders
        WHERE payment_status IN ('Pending', 'Failed')
          AND razorpay_order_id IS NOT NULL
-         AND created_at <= NOW() - ($1 * INTERVAL '1 minute')
+         AND created_at <= DATE_SUB(NOW(), INTERVAL ? MINUTE)
        ORDER BY created_at ASC
        LIMIT 50`,
       [minutes]
@@ -415,9 +415,9 @@ export async function createOrder(req, res) {
     const { rows: duplicates } = await query(
       `SELECT id
        FROM orders
-       WHERE phone = $1
-         AND total_amount = $2
-         AND created_at >= NOW() - INTERVAL '2 minutes'
+       WHERE phone = ?
+         AND total_amount = ?
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 2 MINUTE)
        LIMIT 1`,
       [orderData.phone, orderData.total_amount]
     );
@@ -430,7 +430,7 @@ export async function createOrder(req, res) {
       });
     }
 
-    const { rows: inserted } = await query(
+    const inserted = await query(
       `INSERT INTO orders (
         customer_name,
         phone,
@@ -448,9 +448,8 @@ export async function createOrder(req, res) {
         whatsapp_updates_consent,
         whatsapp_consent_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'Pending', 'New', $12, $13
-      )
-      RETURNING id`,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 'New', ?, ?
+      )`,
       [
         orderData.customer_name,
         orderData.phone,
@@ -463,21 +462,22 @@ export async function createOrder(req, res) {
         orderData.unit_price,
         orderData.total_amount,
         orderData.payment_method,
-        orderData.whatsapp_updates_consent,
+        orderData.whatsapp_updates_consent ? 1 : 0,
         orderData.whatsapp_consent_at,
       ]
     );
 
-    const id = inserted[0].id;
+    const id = inserted.insertId;
     const orderNumber = `TAQ-${String(id).padStart(6, "0")}`;
 
-    const { rows } = await query(
+    await query(
       `UPDATE orders
-       SET order_number = $1
-       WHERE id = $2
-       RETURNING *`,
+       SET order_number = ?
+       WHERE id = ?`,
       [orderNumber, id]
     );
+
+    const { rows } = await query(`SELECT * FROM orders WHERE id = ?`, [id]);
 
     return res.status(201).json({
       success: true,
@@ -507,7 +507,7 @@ export async function getOrderById(req, res) {
     const { rows } = await query(
       `SELECT *
        FROM orders
-       WHERE id = $1`,
+       WHERE id = ?`,
       [id]
     );
 
@@ -592,7 +592,7 @@ export async function updateOrder(req, res) {
 
     const { rows: existing } = await query(
       `SELECT id, order_status, payment_status, quantity, order_number
-       FROM orders WHERE id = $1`,
+       FROM orders WHERE id = ?`,
       [id]
     );
 
@@ -614,16 +614,17 @@ export async function updateOrder(req, res) {
     try {
       await client.query("BEGIN");
 
-      const { rows } = await client.query(
+      await client.query(
         `UPDATE orders
          SET
-           order_status = COALESCE($1, order_status),
-           payment_status = COALESCE($2, payment_status),
+           order_status = COALESCE(?, order_status),
+           payment_status = COALESCE(?, payment_status),
            updated_at = CURRENT_TIMESTAMP
-         WHERE id = $3
-         RETURNING *`,
+         WHERE id = ?`,
         [order_status ?? null, payment_status ?? null, id]
       );
+
+      const { rows } = await client.query(`SELECT * FROM orders WHERE id = ?`, [id]);
 
       if (
         isCancelling &&
@@ -675,14 +676,13 @@ export async function deleteOrder(req, res) {
       });
     }
 
-    const { rows } = await query(
+    const { rowCount } = await query(
       `DELETE FROM orders
-       WHERE id = $1
-       RETURNING id`,
+       WHERE id = ?`,
       [id]
     );
 
-    if (rows.length === 0) {
+    if (!rowCount) {
       return res.status(404).json({
         success: false,
         message: "Order not found",

@@ -62,7 +62,7 @@ export async function submitContact(req, res) {
         email,
         message
       ) VALUES (
-        $1, $2, $3, $4
+        ?, ?, ?, ?
       )`,
       [full_name, phone, email, message]
     );

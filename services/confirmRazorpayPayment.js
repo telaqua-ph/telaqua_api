@@ -4,6 +4,11 @@
  */
 
 import { pool, query } from "../config/db.js";
+import {
+  isDuplicateKeyError,
+  isMissingColumnError,
+  isMissingTableError,
+} from "../lib/dbErrors.js";
 import { getRazorpayClient } from "../config/razorpay.js";
 import { incrementPromoUsedCount } from "./promoService.js";
 import { processOrderFulfillment } from "./invoiceService.js";
@@ -11,6 +16,15 @@ import {
   deductStockForSale,
   dispatchInventoryAlertEmails,
 } from "./inventoryService.js";
+
+/** Hostinger MySQL: resolve strings in JS — avoid mixed-collation COALESCE/NULLIF in SQL. */
+function coalesceString(...values) {
+  for (const value of values) {
+    const text = value == null ? "" : String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
 
 export function logPaymentEvent(code, extra = {}) {
   const payload = {
@@ -34,10 +48,6 @@ export function triggerOrderFulfillmentAsync(orderId) {
   });
 }
 
-function isMissingColumnError(err, column) {
-  return err?.code === "42703" || String(err?.message || "").includes(column);
-}
-
 function orderSelectSql(includeTestAndFinal) {
   if (includeTestAndFinal) {
     return `SELECT
@@ -50,7 +60,7 @@ function orderSelectSql(includeTestAndFinal) {
          razorpay_payment_id,
          payment_method,
          COALESCE(final_total, total_amount) AS expected_total,
-         COALESCE(is_test_order, FALSE) AS is_test_order
+         COALESCE(is_test_order, 0) AS is_test_order
        FROM orders`;
   }
   return `SELECT
@@ -63,23 +73,56 @@ function orderSelectSql(includeTestAndFinal) {
          razorpay_payment_id,
          payment_method,
          total_amount AS expected_total,
-         FALSE AS is_test_order
+         0 AS is_test_order
        FROM orders`;
 }
+
+const PAID_ORDER_RETURN_COLS = `
+  id,
+  order_number,
+  quantity,
+  promo_code,
+  payment_status,
+  order_status,
+  payment_method,
+  razorpay_order_id,
+  razorpay_payment_id,
+  COALESCE(is_test_order, 0) AS is_test_order`;
 
 async function selectOrderForUpdate(client, { razorpayOrderId, orderId }) {
   const run = (sql, params) => client.query(`${sql} FOR UPDATE`, params);
   try {
     if (orderId) {
-      return await run(`${orderSelectSql(true)} WHERE id = $1`, [orderId]);
+      return await run(`${orderSelectSql(true)} WHERE id = ?`, [orderId]);
     }
-    return await run(`${orderSelectSql(true)} WHERE razorpay_order_id = $1`, [razorpayOrderId]);
+    return await run(`${orderSelectSql(true)} WHERE razorpay_order_id = ?`, [razorpayOrderId]);
   } catch (err) {
     if (isMissingColumnError(err, "is_test_order") || isMissingColumnError(err, "final_total")) {
       if (orderId) {
-        return run(`${orderSelectSql(false)} WHERE id = $1`, [orderId]);
+        return run(`${orderSelectSql(false)} WHERE id = ?`, [orderId]);
       }
-      return run(`${orderSelectSql(false)} WHERE razorpay_order_id = $1`, [razorpayOrderId]);
+      return run(`${orderSelectSql(false)} WHERE razorpay_order_id = ?`, [razorpayOrderId]);
+    }
+    throw err;
+  }
+}
+
+async function fetchPaidOrderRow(client, orderId, includeTest = true) {
+  try {
+    const cols = includeTest
+      ? PAID_ORDER_RETURN_COLS
+      : PAID_ORDER_RETURN_COLS.replace("COALESCE(is_test_order, 0) AS is_test_order", "0 AS is_test_order");
+    return await client.query(
+      `SELECT ${cols} FROM orders WHERE id = ? AND payment_status = 'Paid' LIMIT 1`,
+      [orderId]
+    );
+  } catch (err) {
+    if (isMissingColumnError(err, "is_test_order")) {
+      return client.query(
+        `SELECT ${PAID_ORDER_RETURN_COLS.replace("COALESCE(is_test_order, 0) AS is_test_order", "0 AS is_test_order")}
+         FROM orders WHERE id = ? AND payment_status = 'Paid' LIMIT 1`,
+        [orderId]
+      );
     }
     throw err;
   }
@@ -89,15 +132,13 @@ async function recordWebhookEvent(client, eventId, eventType) {
   if (!eventId) return { duplicate: false };
   try {
     const inserted = await client.query(
-      `INSERT INTO razorpay_webhook_events (event_id, event_type)
-       VALUES ($1, $2)
-       ON CONFLICT (event_id) DO NOTHING
-       RETURNING event_id`,
+      `INSERT IGNORE INTO razorpay_webhook_events (event_id, event_type)
+       VALUES (?, ?)`,
       [eventId, eventType || "unknown"]
     );
-    return { duplicate: inserted.rows.length === 0 };
+    return { duplicate: inserted.rowCount === 0 };
   } catch (err) {
-    if (err?.code === "42P01" || String(err?.message || "").includes("razorpay_webhook_events")) {
+    if (isMissingTableError(err) || String(err?.message || "").includes("razorpay_webhook_events")) {
       console.warn("razorpay_webhook_events table missing; continuing without event dedup");
       return { duplicate: false };
     }
@@ -105,9 +146,6 @@ async function recordWebhookEvent(client, eventId, eventType) {
   }
 }
 
-/**
- * If razorpay_order_id is not on the row yet, recover via Razorpay notes.website_order_db_id.
- */
 async function recoverOrderFromRazorpayNotes(client, razorpayOrderId) {
   try {
     const rzOrder = await getRazorpayClient().orders.fetch(razorpayOrderId);
@@ -117,10 +155,10 @@ async function recoverOrderFromRazorpayNotes(client, razorpayOrderId) {
     if (!found.rows.length) return found;
     await client.query(
       `UPDATE orders
-       SET razorpay_order_id = COALESCE(razorpay_order_id, $2),
+       SET razorpay_order_id = COALESCE(razorpay_order_id, ?),
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [dbId, razorpayOrderId]
+       WHERE id = ?`,
+      [razorpayOrderId, dbId]
     );
     found.rows[0].razorpay_order_id = found.rows[0].razorpay_order_id || razorpayOrderId;
     return found;
@@ -161,9 +199,6 @@ export async function fetchCapturedPaymentForOrder(razorpayOrderId) {
   );
 }
 
-/**
- * Atomically mark the existing order Paid + Confirmed.
- */
 export async function confirmCapturedRazorpayPayment({
   razorpayOrderId,
   razorpayPaymentId,
@@ -242,14 +277,17 @@ export async function confirmCapturedRazorpayPayment({
     }
 
     if (order.payment_status === "Paid") {
+      const nextPaymentId = coalesceString(order.razorpay_payment_id, paymentId);
+      const nextSignature = coalesceString(razorpaySignature, order.razorpay_signature);
+      const nextMethod = coalesceString(paymentMethod, order.payment_method, "Razorpay");
       await client.query(
         `UPDATE orders
-         SET razorpay_payment_id = COALESCE(razorpay_payment_id, $2),
-             razorpay_signature = COALESCE(razorpay_signature, $3),
-             payment_method = COALESCE(NULLIF($4, ''), payment_method),
+         SET razorpay_payment_id = ?,
+             razorpay_signature = ?,
+             payment_method = ?,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1 AND payment_status = 'Paid'`,
-        [order.id, paymentId, razorpaySignature, paymentMethod]
+         WHERE id = ? AND payment_status = 'Paid'`,
+        [nextPaymentId, nextSignature, nextMethod, order.id]
       );
       await client.query("COMMIT");
       logPaymentEvent("ORDER_ALREADY_PAID", {
@@ -271,57 +309,45 @@ export async function confirmCapturedRazorpayPayment({
     }
 
     let updated;
+    const nextSignature = coalesceString(razorpaySignature, order.razorpay_signature);
+    const nextMethod = coalesceString(paymentMethod, order.payment_method, "Razorpay");
     try {
-      updated = await client.query(
+      const upd = await client.query(
         `UPDATE orders
          SET payment_status = 'Paid',
              order_status = 'Confirmed',
-             razorpay_payment_id = $2,
-             razorpay_signature = COALESCE($3, razorpay_signature),
-             payment_method = COALESCE(NULLIF($4, ''), payment_method),
+             razorpay_payment_id = ?,
+             razorpay_signature = ?,
+             payment_method = ?,
              payment_date = COALESCE(payment_date, CURRENT_TIMESTAMP),
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1
-           AND payment_status IN ('Pending', 'Failed')
-         RETURNING
-           id,
-           order_number,
-           quantity,
-           promo_code,
-           payment_status,
-           order_status,
-           payment_method,
-           razorpay_order_id,
-           razorpay_payment_id,
-           COALESCE(is_test_order, FALSE) AS is_test_order`,
-        [order.id, paymentId, razorpaySignature, paymentMethod]
+         WHERE id = ?
+           AND payment_status IN ('Pending', 'Failed')`,
+        [paymentId, nextSignature, nextMethod, order.id]
       );
+      if (!upd.rowCount) {
+        updated = { rows: [] };
+      } else {
+        updated = await fetchPaidOrderRow(client, order.id, true);
+      }
     } catch (updErr) {
       if (isMissingColumnError(updErr, "is_test_order")) {
-        updated = await client.query(
+        const upd = await client.query(
           `UPDATE orders
            SET payment_status = 'Paid',
                order_status = 'Confirmed',
-               razorpay_payment_id = $2,
-               razorpay_signature = COALESCE($3, razorpay_signature),
-               payment_method = COALESCE(NULLIF($4, ''), payment_method),
+               razorpay_payment_id = ?,
+               razorpay_signature = ?,
+               payment_method = ?,
                payment_date = COALESCE(payment_date, CURRENT_TIMESTAMP),
                updated_at = CURRENT_TIMESTAMP
-           WHERE id = $1
-             AND payment_status IN ('Pending', 'Failed')
-           RETURNING
-             id,
-             order_number,
-             quantity,
-             promo_code,
-             payment_status,
-             order_status,
-             payment_method,
-             razorpay_order_id,
-             razorpay_payment_id,
-             FALSE AS is_test_order`,
-          [order.id, paymentId, razorpaySignature, paymentMethod]
+           WHERE id = ?
+             AND payment_status IN ('Pending', 'Failed')`,
+          [paymentId, nextSignature, nextMethod, order.id]
         );
+        updated = upd.rowCount
+          ? await fetchPaidOrderRow(client, order.id, false)
+          : { rows: [] };
       } else {
         throw updErr;
       }
@@ -351,7 +377,7 @@ export async function confirmCapturedRazorpayPayment({
         orderId: newlyPaid.id,
         orderNumber: newlyPaid.order_number,
         quantity: newlyPaid.quantity,
-        isTestOrder: newlyPaid.is_test_order,
+        isTestOrder: Boolean(newlyPaid.is_test_order),
       });
 
       if (stockResult.status === "insufficient_stock") {
@@ -371,7 +397,7 @@ export async function confirmCapturedRazorpayPayment({
 
       inventoryEmails = stockResult.pendingEmails || [];
     } catch (invErr) {
-      if (invErr?.code === "42P01") {
+      if (isMissingTableError(invErr)) {
         console.warn(
           "Inventory tables missing during payment confirm; run sql/add_inventory.sql"
         );
@@ -390,12 +416,12 @@ export async function confirmCapturedRazorpayPayment({
       message: err?.message,
       code: err?.code,
     });
-    if (err?.code === "23505") {
+    if (isDuplicateKeyError(err)) {
       const paid = await query(
         `SELECT id, order_number, payment_status, promo_code,
                 razorpay_order_id, razorpay_payment_id, payment_method
          FROM orders
-         WHERE razorpay_payment_id = $1
+         WHERE razorpay_payment_id = ?
          LIMIT 1`,
         [paymentId]
       );
@@ -480,7 +506,7 @@ export async function markRazorpayPaymentFailed(razorpayOrderId, webhookEventId,
       `UPDATE orders
        SET payment_status = 'Failed',
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1 AND payment_status <> 'Paid'`,
+       WHERE id = ? AND payment_status <> 'Paid'`,
       [order.id]
     );
     await client.query("COMMIT");
@@ -499,30 +525,27 @@ export async function markRazorpayPaymentFailed(razorpayOrderId, webhookEventId,
   }
 }
 
-/**
- * Confirm a Neon order from Razorpay's live captured payment. Never marks Paid unless captured.
- */
 export async function reconcileRazorpayOrder({ razorpayOrderId, orderId } = {}) {
   let rzOrderId = String(razorpayOrderId || "").trim();
-  let neonOrder = null;
+  let dbOrder = null;
 
   if (orderId) {
     const { rows } = await query(
       `SELECT id, order_number, payment_status, razorpay_order_id,
               COALESCE(final_total, total_amount) AS expected_total
-       FROM orders WHERE id = $1 LIMIT 1`,
+       FROM orders WHERE id = ? LIMIT 1`,
       [orderId]
     );
-    neonOrder = rows[0] || null;
-    rzOrderId = rzOrderId || String(neonOrder?.razorpay_order_id || "").trim();
+    dbOrder = rows[0] || null;
+    rzOrderId = rzOrderId || String(dbOrder?.razorpay_order_id || "").trim();
   } else if (rzOrderId) {
     const { rows } = await query(
       `SELECT id, order_number, payment_status, razorpay_order_id,
               COALESCE(final_total, total_amount) AS expected_total
-       FROM orders WHERE razorpay_order_id = $1 LIMIT 1`,
+       FROM orders WHERE razorpay_order_id = ? LIMIT 1`,
       [rzOrderId]
     );
-    neonOrder = rows[0] || null;
+    dbOrder = rows[0] || null;
   }
 
   if (!rzOrderId) {
@@ -534,22 +557,22 @@ export async function reconcileRazorpayOrder({ razorpayOrderId, orderId } = {}) 
     return {
       status: "not_captured",
       message: "Razorpay has no captured payment for this order",
-      order: neonOrder,
+      order: dbOrder,
     };
   }
 
-  if (neonOrder) {
-    const expectedPaise = expectedAmountPaise(neonOrder);
+  if (dbOrder) {
+    const expectedPaise = expectedAmountPaise(dbOrder);
     if (Number(captured.amount) !== expectedPaise || String(captured.currency || "INR").toUpperCase() !== "INR") {
       logPaymentEvent("PAYMENT_AMOUNT_MISMATCH", {
-        orderId: neonOrder.id,
-        orderNumber: neonOrder.order_number,
+        orderId: dbOrder.id,
+        orderNumber: dbOrder.order_number,
         razorpayOrderId: rzOrderId,
         razorpayPaymentId: captured.id,
         expectedPaise,
         paymentAmount: captured.amount,
       });
-      return { status: "amount_mismatch", order: neonOrder };
+      return { status: "amount_mismatch", order: dbOrder };
     }
   }
 
@@ -562,10 +585,8 @@ export async function reconcileRazorpayOrder({ razorpayOrderId, orderId } = {}) 
     capturedCurrency: captured.currency,
   });
 
-  if (result.status === "marked_paid") {
-    triggerOrderFulfillmentAsync(result.order.id);
-  } else if (result.status === "already_paid") {
-    triggerOrderFulfillmentAsync(result.order.id);
+  if (result.status === "marked_paid" || result.status === "already_paid") {
+    triggerOrderFulfillmentAsync(result.order?.id);
   }
 
   return result;

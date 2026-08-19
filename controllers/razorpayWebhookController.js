@@ -42,7 +42,7 @@ async function resolveCapturedPayment(event, razorpayOrderId) {
 async function loadOrderExpectedAmount(razorpayOrderId) {
   const { rows } = await query(
     `SELECT id, order_number, COALESCE(final_total, total_amount) AS expected_total
-     FROM orders WHERE razorpay_order_id = $1 LIMIT 1`,
+     FROM orders WHERE razorpay_order_id = ? LIMIT 1`,
     [razorpayOrderId]
   );
   if (rows.length) return rows[0];
@@ -52,7 +52,7 @@ async function loadOrderExpectedAmount(razorpayOrderId) {
     if (!Number.isInteger(dbId) || dbId <= 0) return null;
     const byId = await query(
       `SELECT id, order_number, COALESCE(final_total, total_amount) AS expected_total
-       FROM orders WHERE id = $1 LIMIT 1`,
+       FROM orders WHERE id = ? LIMIT 1`,
       [dbId]
     );
     return byId.rows[0] || null;

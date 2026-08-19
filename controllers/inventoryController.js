@@ -12,6 +12,7 @@ import {
   markNotificationRead,
   updateLowStockThreshold,
 } from "../services/inventoryService.js";
+import { isMissingTableError } from "../lib/dbErrors.js";
 
 function adminId(req) {
   const id = Number(req.user?.admin_id ?? req.user?.id);
@@ -24,7 +25,7 @@ export async function getInventory(req, res) {
     return res.status(200).json({ success: true, ...data });
   } catch (err) {
     console.error("GET inventory error:", err?.message);
-    if (err?.code === "42P01") {
+    if (isMissingTableError(err)) {
       return res.status(503).json({
         success: false,
         message: "Inventory tables missing. Run sql/add_inventory.sql",

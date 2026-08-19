@@ -8,6 +8,8 @@
 
 import crypto from "node:crypto";
 import { query } from "../config/db.js";
+import { isMissingColumnError } from "../lib/dbErrors.js";
+import { ensureColumn } from "../lib/schemaHelpers.js";
 import { getRazorpayClient } from "../config/razorpay.js";
 import {
   normalizePromoCode,
@@ -60,9 +62,11 @@ function isValidEmail(email) {
  */
 async function ensureIsTestOrderColumn() {
   if (isTestOrderColumnReady) return;
-  await query(
+  await ensureColumn(
+    "orders",
+    "is_test_order",
     `ALTER TABLE orders
-     ADD COLUMN IF NOT EXISTS is_test_order BOOLEAN NOT NULL DEFAULT FALSE`
+     ADD COLUMN is_test_order TINYINT(1) NOT NULL DEFAULT 0`
   );
   isTestOrderColumnReady = true;
 }
@@ -895,7 +899,7 @@ export async function createPaymentOrder(req, res) {
 
     const financial = buildFinancialSnapshot(pricing);
     const invoiceAccess = createInvoiceAccessToken();
-    const { rows: inserted } = await query(
+    const inserted = await query(
       `INSERT INTO orders (
         customer_name,
         phone,
@@ -924,11 +928,10 @@ export async function createPaymentOrder(req, res) {
         whatsapp_updates_consent,
         whatsapp_consent_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        'Razorpay', 'Pending', 'New', $11, $12, $13, $14, $15,
-        $16, $17, $18, $19, 'not_created', $20, $21, $22
-      )
-      RETURNING id`,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        'Razorpay', 'Pending', 'New', ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, 'not_created', ?, ?, ?
+      )`,
       [
         orderData.customer_name,
         orderData.phone,
@@ -950,17 +953,17 @@ export async function createPaymentOrder(req, res) {
         financial.shippingAmount,
         financial.finalTotal,
         invoiceAccess.hash,
-        orderData.whatsapp_updates_consent,
+        orderData.whatsapp_updates_consent ? 1 : 0,
         orderData.whatsapp_consent_at,
       ]
     );
 
-    const dbOrderId = inserted[0].id;
+    const dbOrderId = inserted.insertId;
     const orderNumber = `TAQ-${String(dbOrderId).padStart(6, "0")}`;
 
     await query(
-      `UPDATE orders SET order_number = $1, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
+      `UPDATE orders SET order_number = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
       [orderNumber, dbOrderId]
     );
 
@@ -981,8 +984,8 @@ export async function createPaymentOrder(req, res) {
     });
 
     await query(
-      `UPDATE orders SET razorpay_order_id = $1,
-         updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+      `UPDATE orders SET razorpay_order_id = ?,
+         updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [razorpayOrder.id, dbOrderId]
     );
 
@@ -1014,10 +1017,9 @@ export async function createPaymentOrder(req, res) {
     console.error("Payment create-order error:", error);
 
     if (
-      error?.code === "42703" ||
-      String(error?.message || "").includes("promo_code") ||
-      String(error?.message || "").includes("original_amount") ||
-      String(error?.message || "").includes("discount_amount")
+      isMissingColumnError(error, "promo_code") ||
+      isMissingColumnError(error, "original_amount") ||
+      isMissingColumnError(error, "discount_amount")
     ) {
       return res.status(500).json({
         success: false,
@@ -1171,12 +1173,11 @@ export async function createTestPaymentOrder(req, res) {
           whatsapp_updates_consent,
           whatsapp_consent_at
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-          'Razorpay', 'Pending', 'New', $11, NULL, $12, 0,
-          $13, $14, $15, $16, $17, $18, 'not_created', $19, TRUE,
-          $20, $21
-        )
-        RETURNING id`,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          'Razorpay', 'Pending', 'New', ?, NULL, ?, 0,
+          ?, ?, ?, ?, ?, ?, 'not_created', ?, 1,
+          ?, ?
+        )`,
         [
           orderData.customer_name,
           orderData.phone,
@@ -1197,11 +1198,11 @@ export async function createTestPaymentOrder(req, res) {
           testFinancial.shippingAmount,
           testFinancial.finalTotal,
           invoiceAccess.hash,
-          orderData.whatsapp_updates_consent,
+          orderData.whatsapp_updates_consent ? 1 : 0,
           orderData.whatsapp_consent_at,
         ]
       );
-      inserted = result.rows;
+      inserted = [{ id: result.insertId }];
     } catch (dbErr) {
       console.error("TEST ORDER: database insert failure:", {
         code: dbErr?.code,
@@ -1224,9 +1225,9 @@ export async function createTestPaymentOrder(req, res) {
 
     await query(
       `UPDATE orders
-       SET order_number = $1,
+       SET order_number = ?,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
+       WHERE id = ?`,
       [orderNumber, dbOrderId]
     );
 
@@ -1309,16 +1310,16 @@ export async function verifyPayment(req, res) {
            discount_amount,
            razorpay_order_id,
            razorpay_payment_id,
-           COALESCE(is_test_order, FALSE) AS is_test_order
+           COALESCE(is_test_order, 0) AS is_test_order
          FROM orders
-         WHERE razorpay_order_id = $1
+         WHERE razorpay_order_id = ?
          LIMIT 1`,
         [razorpay_order_id]
       );
     } catch (selectErr) {
       if (
-        selectErr?.code === "42703" ||
-        String(selectErr?.message || "").includes("is_test_order")
+        selectErr?.code === "ER_BAD_FIELD_ERROR" ||
+        isMissingColumnError(selectErr, "is_test_order")
       ) {
         existingOrder = await query(
           `SELECT
@@ -1333,7 +1334,7 @@ export async function verifyPayment(req, res) {
              razorpay_payment_id,
              FALSE AS is_test_order
            FROM orders
-           WHERE razorpay_order_id = $1
+           WHERE razorpay_order_id = ?
            LIMIT 1`,
           [razorpay_order_id]
         );
@@ -1396,17 +1397,17 @@ export async function verifyPayment(req, res) {
            payment_status,
            razorpay_order_id,
            razorpay_payment_id,
-           COALESCE(is_test_order, FALSE) AS is_test_order
+           COALESCE(is_test_order, 0) AS is_test_order
          FROM orders
-         WHERE razorpay_payment_id = $1
+         WHERE razorpay_payment_id = ?
            AND payment_status = 'Paid'
          LIMIT 1`,
         [razorpay_payment_id]
       );
     } catch (dupErr) {
       if (
-        dupErr?.code === "42703" ||
-        String(dupErr?.message || "").includes("is_test_order")
+        dupErr?.code === "ER_BAD_FIELD_ERROR" ||
+        isMissingColumnError(dupErr, "is_test_order")
       ) {
         byPayment = await query(
           `SELECT
@@ -1417,7 +1418,7 @@ export async function verifyPayment(req, res) {
              razorpay_payment_id,
              FALSE AS is_test_order
            FROM orders
-           WHERE razorpay_payment_id = $1
+           WHERE razorpay_payment_id = ?
              AND payment_status = 'Paid'
            LIMIT 1`,
           [razorpay_payment_id]
@@ -1578,8 +1579,7 @@ export async function verifyPayment(req, res) {
     console.error("Payment verify-payment error:", error?.message || error);
 
     if (
-      error?.code === "42703" ||
-      String(error?.message || "").includes("is_test_order")
+      isMissingColumnError(error, "is_test_order")
     ) {
       return res.status(500).json({
         success: false,

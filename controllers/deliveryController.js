@@ -7,6 +7,7 @@
  */
 
 import { createShipment } from "../services/delhiveryService.js";
+import { isMissingColumnError } from "../lib/dbErrors.js";
 import { query } from "../config/db.js";
 
 /** Max chargeable weight in grams (50 kg). */
@@ -547,22 +548,27 @@ function interpretShipmentCreateResult(data) {
  * Does not change order_status (shipment created ≠ shipped).
  */
 async function persistAwbOnOrder(orderId, { awb, shipmentId }) {
-  let updated;
+  let saved;
   try {
-    updated = await query(
+    await query(
       `UPDATE orders SET
-         waybill = $2,
+         waybill = ?,
          shipment_status = 'Created',
-         delhivery_shipment_id = COALESCE($3, delhivery_shipment_id),
+         delhivery_shipment_id = COALESCE(?, delhivery_shipment_id),
          shipment_created_at = COALESCE(shipment_created_at, CURRENT_TIMESTAMP),
          shipment_error = NULL,
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1
-       RETURNING id, waybill, shipment_status, delhivery_shipment_id, shipment_created_at`,
-      [orderId, awb, shipmentId || null]
+       WHERE id = ?`,
+      [awb, shipmentId || null, orderId]
     );
+    const result = await query(
+      `SELECT id, waybill, shipment_status, delhivery_shipment_id, shipment_created_at
+       FROM orders WHERE id = ? LIMIT 1`,
+      [orderId]
+    );
+    saved = result.rows[0];
   } catch (err) {
-    if (err?.code === "42703") {
+    if (isMissingColumnError(err)) {
       const missing = new Error(
         `Cannot save AWB: a required orders column is missing (${err.message}).`
       );
@@ -574,23 +580,23 @@ async function persistAwbOnOrder(orderId, { awb, shipmentId }) {
 
   try {
     await query(
-      `UPDATE orders SET delivery_provider = 'Delhivery' WHERE id = $1`,
+      `UPDATE orders SET delivery_provider = 'Delhivery' WHERE id = ?`,
       [orderId]
     );
   } catch (err) {
-    if (err?.code !== "42703") throw err;
+    if (!isMissingColumnError(err)) throw err;
   }
 
-  return updated.rows[0];
+  return saved;
 }
 
 async function recordShipmentError(orderId, message) {
   try {
     await query(
       `UPDATE orders SET
-         shipment_error = $2,
+         shipment_error = ?,
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
+       WHERE id = ?`,
       [orderId, String(message || "").slice(0, 1000)]
     );
   } catch {
@@ -637,14 +643,14 @@ export async function createShipmentForOrder(req, res) {
         });
       }
 
-      const { rows } = await query(`SELECT * FROM orders WHERE id = $1`, [
+      const { rows } = await query(`SELECT * FROM orders WHERE id = ?`, [
         orderId,
       ]);
       order = rows[0] || null;
     } else {
       const orderNumber = String(body.order_number).trim();
       const { rows } = await query(
-        `SELECT * FROM orders WHERE order_number = $1`,
+        `SELECT * FROM orders WHERE order_number = ?`,
         [orderNumber]
       );
       order = rows[0] || null;

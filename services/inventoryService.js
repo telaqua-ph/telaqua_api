@@ -4,6 +4,7 @@
  */
 
 import { pool, query } from "../config/db.js";
+import { isMissingTableError } from "../lib/dbErrors.js";
 import { sendInventoryAlertEmail } from "./emailService.js";
 
 export const DEFAULT_PRODUCT_SKU = "telaqua-ph-meter";
@@ -17,7 +18,7 @@ function defaultProductName() {
 function isMissingInventoryTable(err) {
   const msg = String(err?.message || "");
   return (
-    err?.code === "42P01" ||
+    isMissingTableError(err) ||
     msg.includes("inventory") ||
     msg.includes("inventory_history")
   );
@@ -68,17 +69,20 @@ export function shouldResetOutOfStockAlert(newStock) {
 async function ensureInventoryRow(client) {
   const db = client || pool;
   const found = await db.query(
-    `SELECT * FROM inventory WHERE sku = $1 LIMIT 1`,
+    `SELECT * FROM inventory WHERE sku = ? LIMIT 1`,
     [DEFAULT_PRODUCT_SKU]
   );
   if (found.rows[0]) return found.rows[0];
 
-  const inserted = await db.query(
+  await db.query(
     `INSERT INTO inventory (sku, product_name, current_stock, low_stock_threshold)
-     VALUES ($1, $2, 0, 10)
-     ON CONFLICT (sku) DO UPDATE SET sku = EXCLUDED.sku
-     RETURNING *`,
+     VALUES (?, ?, 0, 10)
+     ON DUPLICATE KEY UPDATE sku = sku`,
     [DEFAULT_PRODUCT_SKU, defaultProductName()]
+  );
+  const inserted = await db.query(
+    `SELECT * FROM inventory WHERE sku = ? LIMIT 1`,
+    [DEFAULT_PRODUCT_SKU]
   );
   return inserted.rows[0];
 }
@@ -88,7 +92,7 @@ async function recordHistory(client, row) {
     `INSERT INTO inventory_history (
        inventory_id, sku, quantity_change, transaction_type,
        order_id, order_number, reason, previous_stock, new_stock, admin_id
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.inventory_id,
       row.sku,
@@ -114,7 +118,7 @@ async function createNotification(client, row, type) {
     `INSERT INTO admin_notifications (
        notification_type, inventory_id, sku, product_name,
        stock_at_notification, threshold, message
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       type,
       row.id,
@@ -187,11 +191,11 @@ async function applyAlertFlags(client, inventoryRow, previousStock) {
   ) {
     await client.query(
       `UPDATE inventory
-       SET low_stock_alert_active = $2,
-           out_of_stock_alert_active = $3,
+       SET low_stock_alert_active = ?,
+           out_of_stock_alert_active = ?,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [inventoryRow.id, lowActive, outActive]
+       WHERE id = ?`,
+      [lowActive ? 1 : 0, outActive ? 1 : 0, inventoryRow.id]
     );
   }
 
@@ -215,7 +219,7 @@ export function dispatchInventoryAlertEmails(pendingEmails = []) {
 export async function getAvailableStock(sku = DEFAULT_PRODUCT_SKU) {
   try {
     const { rows } = await query(
-      `SELECT current_stock FROM inventory WHERE sku = $1 LIMIT 1`,
+      `SELECT current_stock FROM inventory WHERE sku = ? LIMIT 1`,
       [sku]
     );
     if (!rows[0]) return null;
@@ -226,7 +230,6 @@ export async function getAvailableStock(sku = DEFAULT_PRODUCT_SKU) {
   }
 }
 
-/** Pre-checkout validation — rejects when requested quantity exceeds stock. */
 export async function assertStockAvailable(quantity, sku = DEFAULT_PRODUCT_SKU) {
   const qty = Number(quantity);
   if (!Number.isInteger(qty) || qty <= 0) {
@@ -257,17 +260,26 @@ export async function assertStockAvailable(quantity, sku = DEFAULT_PRODUCT_SKU) 
 async function findExistingHistory(client, orderId, transactionType) {
   const { rows } = await client.query(
     `SELECT id FROM inventory_history
-     WHERE order_id = $1 AND transaction_type = $2
+     WHERE order_id = ? AND transaction_type = ?
      LIMIT 1`,
     [orderId, transactionType]
   );
   return rows[0] || null;
 }
 
-/**
- * Deduct stock when an order is first marked Paid/Confirmed.
- * Must run inside the payment confirmation transaction (same client).
- */
+async function insertInventoryIfMissing(client, sku) {
+  const inserted = await client.query(
+    `INSERT INTO inventory (sku, product_name, current_stock, low_stock_threshold)
+     VALUES (?, ?, 0, 10)`,
+    [sku, defaultProductName()]
+  );
+  const { rows } = await client.query(
+    `SELECT * FROM inventory WHERE id = ? LIMIT 1`,
+    [inserted.insertId]
+  );
+  return rows[0];
+}
+
 export async function deductStockForSale(client, {
   orderId,
   orderNumber,
@@ -289,18 +301,12 @@ export async function deductStockForSale(client, {
   }
 
   const locked = await client.query(
-    `SELECT * FROM inventory WHERE sku = $1 FOR UPDATE`,
+    `SELECT * FROM inventory WHERE sku = ? FOR UPDATE`,
     [DEFAULT_PRODUCT_SKU]
   );
   let inv = locked.rows[0];
   if (!inv) {
-    const inserted = await client.query(
-      `INSERT INTO inventory (sku, product_name, current_stock, low_stock_threshold)
-       VALUES ($1, $2, 0, 10)
-       RETURNING *`,
-      [DEFAULT_PRODUCT_SKU, defaultProductName()]
-    );
-    inv = inserted.rows[0];
+    inv = await insertInventoryIfMissing(client, DEFAULT_PRODUCT_SKU);
   }
 
   if (inv.current_stock < qty) {
@@ -316,9 +322,9 @@ export async function deductStockForSale(client, {
 
   await client.query(
     `UPDATE inventory
-     SET current_stock = $2, updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1`,
-    [inv.id, newStock]
+     SET current_stock = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [newStock, inv.id]
   );
 
   await recordHistory(client, {
@@ -343,9 +349,6 @@ export async function deductStockForSale(client, {
   };
 }
 
-/**
- * Restore stock when a paid order is cancelled (idempotent).
- */
 export async function restoreStockForCancellation(client, {
   orderId,
   orderNumber,
@@ -372,7 +375,7 @@ export async function restoreStockForCancellation(client, {
   }
 
   const locked = await client.query(
-    `SELECT * FROM inventory WHERE sku = $1 FOR UPDATE`,
+    `SELECT * FROM inventory WHERE sku = ? FOR UPDATE`,
     [DEFAULT_PRODUCT_SKU]
   );
   const inv = locked.rows[0];
@@ -385,9 +388,9 @@ export async function restoreStockForCancellation(client, {
 
   await client.query(
     `UPDATE inventory
-     SET current_stock = $2, updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1`,
-    [inv.id, newStock]
+     SET current_stock = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [newStock, inv.id]
   );
 
   await recordHistory(client, {
@@ -416,9 +419,9 @@ export async function restoreStockForCancellation(client, {
 
 async function aggregateSold(sku) {
   const { rows } = await query(
-    `SELECT COALESCE(SUM(ABS(quantity_change)), 0)::int AS sold
+    `SELECT COALESCE(SUM(ABS(quantity_change)), 0) AS sold
      FROM inventory_history
-     WHERE sku = $1 AND transaction_type = 'SALE'`,
+     WHERE sku = ? AND transaction_type = 'SALE'`,
     [sku]
   );
   return Number(rows[0]?.sold || 0);
@@ -426,9 +429,9 @@ async function aggregateSold(sku) {
 
 async function aggregateReturns(sku) {
   const { rows } = await query(
-    `SELECT COALESCE(SUM(quantity_change), 0)::int AS returned
+    `SELECT COALESCE(SUM(quantity_change), 0) AS returned
      FROM inventory_history
-     WHERE sku = $1 AND transaction_type IN ('CANCELLATION', 'RETURN')`,
+     WHERE sku = ? AND transaction_type IN ('CANCELLATION', 'RETURN')`,
     [sku]
   );
   return Number(rows[0]?.returned || 0);
@@ -477,10 +480,11 @@ export async function getInventoryHistory({ sku, limit = 50, offset = 0 } = {}) 
   let where = "";
   if (sku) {
     params.push(sku);
-    where = `WHERE h.sku = $${params.length}`;
+    where = `WHERE h.sku = ?`;
   }
-  params.push(Math.min(Math.max(Number(limit) || 50, 1), 200));
-  params.push(Math.max(Number(offset) || 0, 0));
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const off = Math.max(Number(offset) || 0, 0);
+  params.push(lim, off);
 
   const { rows } = await query(
     `SELECT h.*, a.full_name AS admin_name
@@ -488,7 +492,7 @@ export async function getInventoryHistory({ sku, limit = 50, offset = 0 } = {}) 
      LEFT JOIN admins a ON a.id = h.admin_id
      ${where}
      ORDER BY h.created_at DESC
-     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+     LIMIT ? OFFSET ?`,
     params
   );
   return rows;
@@ -514,18 +518,12 @@ export async function addStock({
   try {
     await client.query("BEGIN");
     const locked = await client.query(
-      `SELECT * FROM inventory WHERE sku = $1 FOR UPDATE`,
+      `SELECT * FROM inventory WHERE sku = ? FOR UPDATE`,
       [sku]
     );
     let inv = locked.rows[0];
     if (!inv) {
-      const inserted = await client.query(
-        `INSERT INTO inventory (sku, product_name, current_stock, low_stock_threshold)
-         VALUES ($1, $2, 0, 10)
-         RETURNING *`,
-        [sku, defaultProductName()]
-      );
-      inv = inserted.rows[0];
+      inv = await insertInventoryIfMissing(client, sku);
     }
 
     const previousStock = inv.current_stock;
@@ -533,9 +531,9 @@ export async function addStock({
 
     await client.query(
       `UPDATE inventory
-       SET current_stock = $2, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [inv.id, newStock]
+       SET current_stock = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [newStock, inv.id]
     );
 
     await recordHistory(client, {
@@ -594,7 +592,7 @@ export async function adjustStock({
   try {
     await client.query("BEGIN");
     const locked = await client.query(
-      `SELECT * FROM inventory WHERE sku = $1 FOR UPDATE`,
+      `SELECT * FROM inventory WHERE sku = ? FOR UPDATE`,
       [sku]
     );
     const inv = locked.rows[0];
@@ -610,9 +608,9 @@ export async function adjustStock({
 
     await client.query(
       `UPDATE inventory
-       SET current_stock = $2, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [inv.id, newStock]
+       SET current_stock = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [newStock, inv.id]
     );
 
     await recordHistory(client, {
@@ -656,13 +654,16 @@ export async function updateLowStockThreshold({
     throw new Error("INVALID_THRESHOLD");
   }
 
-  const { rows } = await query(
+  await query(
     `UPDATE inventory
-     SET low_stock_threshold = $2,
+     SET low_stock_threshold = ?,
          updated_at = CURRENT_TIMESTAMP
-     WHERE sku = $1
-     RETURNING *`,
-    [sku, value]
+     WHERE sku = ?`,
+    [value, sku]
+  );
+  const { rows } = await query(
+    `SELECT * FROM inventory WHERE sku = ? LIMIT 1`,
+    [sku]
   );
   if (!rows[0]) {
     throw new Error("INVENTORY_NOT_FOUND");
@@ -671,22 +672,21 @@ export async function updateLowStockThreshold({
 }
 
 export async function listNotifications({ unreadOnly = false, limit = 50 } = {}) {
-  const params = [];
-  let where = unreadOnly ? "WHERE is_read = FALSE" : "";
-  params.push(Math.min(Math.max(Number(limit) || 50, 1), 200));
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const where = unreadOnly ? "WHERE is_read = 0" : "";
 
   const { rows } = await query(
     `SELECT * FROM admin_notifications
      ${where}
      ORDER BY created_at DESC
-     LIMIT $1`,
-    params
+     LIMIT ?`,
+    [lim]
   );
 
   const countResult = await query(
-    `SELECT COUNT(*)::int AS unread_count
+    `SELECT CAST(COUNT(*) AS SIGNED) AS unread_count
      FROM admin_notifications
-     WHERE is_read = FALSE`
+     WHERE is_read = 0`
   );
 
   return {
@@ -696,16 +696,19 @@ export async function listNotifications({ unreadOnly = false, limit = 50 } = {})
 }
 
 export async function markNotificationRead(id) {
-  const { rows } = await query(
+  await query(
     `UPDATE admin_notifications
-     SET is_read = TRUE
-     WHERE id = $1
-     RETURNING *`,
+     SET is_read = 1
+     WHERE id = ?`,
+    [id]
+  );
+  const { rows } = await query(
+    `SELECT * FROM admin_notifications WHERE id = ? LIMIT 1`,
     [id]
   );
   return rows[0] || null;
 }
 
 export async function markAllNotificationsRead() {
-  await query(`UPDATE admin_notifications SET is_read = TRUE WHERE is_read = FALSE`);
+  await query(`UPDATE admin_notifications SET is_read = 1 WHERE is_read = 0`);
 }

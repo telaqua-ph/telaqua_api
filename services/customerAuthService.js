@@ -32,19 +32,26 @@ export async function authenticateCustomerRequest(req) {
     throw error;
   }
 
-  const { rows } = await query(
+  const { rowCount } = await query(
     `UPDATE customer_sessions
      SET last_seen_at = CURRENT_TIMESTAMP
-     WHERE token_id = $1 AND phone = $2 AND revoked_at IS NULL
-       AND expires_at > CURRENT_TIMESTAMP
-     RETURNING token_id, phone, expires_at`,
+     WHERE token_id = ? AND phone = ? AND revoked_at IS NULL
+       AND expires_at > CURRENT_TIMESTAMP`,
     [payload.jti, normalized.phoneNumber]
   );
-  if (!rows.length) {
+  if (!rowCount) {
     const error = new Error("Invalid or expired customer session");
     error.statusCode = 401;
     throw error;
   }
+
+  const { rows } = await query(
+    `SELECT token_id, phone, expires_at
+     FROM customer_sessions
+     WHERE token_id = ? AND phone = ?
+     LIMIT 1`,
+    [payload.jti, normalized.phoneNumber]
+  );
 
   return {
     phone: normalized.phoneNumber,

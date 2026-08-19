@@ -24,8 +24,9 @@ const OTP_PHONE_WINDOW_LIMIT = 5;
 const OTP_IP_WINDOW_MINUTES = 60;
 const OTP_IP_WINDOW_LIMIT = 20;
 
+// Compare last 10 digits only; BINARY avoids MySQL collation mismatches on Hostinger.
 const PHONE_MATCH_SQL = `
-  REGEXP_REPLACE(phone, '[^0-9]', '', 'g') IN ($1, '91' || $1, '0' || $1)
+  BINARY RIGHT(REGEXP_REPLACE(phone, '[^0-9]', ''), 10) = ?
 `;
 
 const SAFE_ORDER_COLUMNS = `
@@ -113,9 +114,9 @@ async function loadOwnedOrder(orderId, phone) {
   if (!Number.isInteger(id) || id <= 0) return null;
   const { rows } = await query(
     `SELECT ${SAFE_ORDER_COLUMNS} FROM orders
-     WHERE id = $2 AND ${PHONE_MATCH_SQL}
+     WHERE id = ? AND ${PHONE_MATCH_SQL}
      LIMIT 1`,
-    [phone, id]
+    [id, phone]
   );
   return rows[0] || null;
 }
@@ -125,7 +126,7 @@ async function missingOwnedOrderResponse(orderId, res) {
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(404).json({ success: false, message: "Order not found" });
   }
-  const { rowCount } = await query("SELECT 1 FROM orders WHERE id = $1 LIMIT 1", [id]);
+  const { rowCount } = await query("SELECT 1 FROM orders WHERE id = ? LIMIT 1", [id]);
   if (rowCount > 0) {
     return res.status(403).json({
       success: false,
@@ -157,14 +158,22 @@ export async function requestCustomerOtp(req, res) {
     ipHash = hashRequestIp(req.ip);
     client = await pool.connect();
     await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [phone]);
+    const lockName = `customer_otp:${phone}`;
+    const lock = await client.query("SELECT GET_LOCK(?, 10) AS locked", [lockName]);
+    if (!lock.rows[0]?.locked) {
+      await client.query("ROLLBACK");
+      return res.status(503).json({
+        success: false,
+        message: "Customer authentication is temporarily unavailable",
+      });
+    }
     const rate = await client.query(
       `SELECT
-         COUNT(*) FILTER (WHERE phone = $1 AND created_at > NOW() - INTERVAL '${OTP_PHONE_WINDOW_MINUTES} minutes')::int AS phone_count,
-         COUNT(*) FILTER (WHERE request_ip_hash = $2 AND created_at > NOW() - INTERVAL '${OTP_IP_WINDOW_MINUTES} minutes')::int AS ip_count,
-         EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - MAX(created_at) FILTER (WHERE phone = $1))) AS seconds_since_last
+         CAST(SUM(CASE WHEN phone = ? AND created_at > DATE_SUB(NOW(), INTERVAL ? MINUTE) THEN 1 ELSE 0 END) AS SIGNED) AS phone_count,
+         CAST(SUM(CASE WHEN request_ip_hash = ? AND created_at > DATE_SUB(NOW(), INTERVAL ? MINUTE) THEN 1 ELSE 0 END) AS SIGNED) AS ip_count,
+         TIMESTAMPDIFF(SECOND, MAX(CASE WHEN phone = ? THEN created_at END), CURRENT_TIMESTAMP) AS seconds_since_last
        FROM customer_auth_otps`,
-      [phone, ipHash]
+      [phone, OTP_PHONE_WINDOW_MINUTES, ipHash, OTP_IP_WINDOW_MINUTES, phone]
     );
     const limits = rate.rows[0];
     if (
@@ -187,17 +196,17 @@ export async function requestCustomerOtp(req, res) {
 
     await client.query(
       `UPDATE customer_auth_otps SET invalidated_at = CURRENT_TIMESTAMP
-       WHERE phone = $1 AND verified_at IS NULL AND invalidated_at IS NULL`,
+       WHERE phone = ? AND verified_at IS NULL AND invalidated_at IS NULL`,
       [phone]
     );
     const inserted = await client.query(
       `INSERT INTO customer_auth_otps
          (phone, otp_hash, expires_at, request_ip_hash)
-       VALUES ($1, $2, NOW() + INTERVAL '${OTP_EXPIRY_MINUTES} minutes', $3)
-       RETURNING id`,
-      [phone, otpHash, ipHash]
+       VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)`,
+      [phone, otpHash, OTP_EXPIRY_MINUTES, ipHash]
     );
-    otpId = inserted.rows[0].id;
+    otpId = inserted.insertId;
+    await client.query("SELECT RELEASE_LOCK(?)", [lockName]).catch(() => {});
     await client.query("COMMIT");
   } catch (error) {
     if (client) await client.query("ROLLBACK").catch(() => {});
@@ -217,13 +226,13 @@ export async function requestCustomerOtp(req, res) {
   try {
     const sent = await sendOtp(phone, otp);
     await query(
-      `UPDATE customer_auth_otps SET provider_message_id = $2 WHERE id = $1`,
+      `UPDATE customer_auth_otps SET provider_message_id = ? WHERE id = ?`,
       [otpId, sent.messageId ? String(sent.messageId) : null]
     );
     return res.status(200).json({ success: true, message: "OTP sent successfully" });
   } catch (error) {
     await query(
-      `UPDATE customer_auth_otps SET invalidated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      `UPDATE customer_auth_otps SET invalidated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [otpId]
     ).catch(() => {});
     console.error("Customer OTP delivery failed:", {
@@ -269,14 +278,19 @@ export async function verifyCustomerOtp(req, res) {
 
   const phone = validated.phone;
   const client = await pool.connect();
+  const lockName = `customer_otp:${phone}`;
   try {
     await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [phone]);
+    const lock = await client.query("SELECT GET_LOCK(?, 10) AS locked", [lockName]);
+    if (!lock.rows[0]?.locked) {
+      await client.query("ROLLBACK");
+      return res.status(503).json({ success: false, message: "Unable to verify OTP" });
+    }
     const found = await client.query(
       `SELECT id, otp_hash, expires_at, attempts,
-              expires_at > CURRENT_TIMESTAMP AS is_valid
+              (expires_at > CURRENT_TIMESTAMP) AS is_valid
        FROM customer_auth_otps
-       WHERE phone = $1 AND verified_at IS NULL AND invalidated_at IS NULL
+       WHERE phone = ? AND verified_at IS NULL AND invalidated_at IS NULL
        ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
       [phone]
     );
@@ -287,7 +301,7 @@ export async function verifyCustomerOtp(req, res) {
     const record = found.rows[0];
     if (!record.is_valid) {
       await client.query(
-        "UPDATE customer_auth_otps SET invalidated_at = CURRENT_TIMESTAMP WHERE id = $1",
+        "UPDATE customer_auth_otps SET invalidated_at = CURRENT_TIMESTAMP WHERE id = ?",
         [record.id]
       );
       await client.query("COMMIT");
@@ -301,13 +315,14 @@ export async function verifyCustomerOtp(req, res) {
       const nextAttempts = Number(record.attempts) + 1;
       await client.query(
         `UPDATE customer_auth_otps
-         SET attempts = $2::smallint,
+         SET attempts = ?,
              invalidated_at = CASE
-               WHEN $2::smallint >= $3::smallint THEN CURRENT_TIMESTAMP
+               WHEN ? >= ? THEN CURRENT_TIMESTAMP
                ELSE invalidated_at END
-         WHERE id = $1`,
-        [record.id, nextAttempts, OTP_MAX_ATTEMPTS]
+         WHERE id = ?`,
+        [nextAttempts, nextAttempts, OTP_MAX_ATTEMPTS, record.id]
       );
+      await client.query("SELECT RELEASE_LOCK(?)", [lockName]).catch(() => {});
       await client.query("COMMIT");
       return res.status(nextAttempts >= OTP_MAX_ATTEMPTS ? 429 : 400).json({
         success: false,
@@ -318,21 +333,22 @@ export async function verifyCustomerOtp(req, res) {
     }
 
     await client.query(
-      `UPDATE customer_auth_otps SET verified_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      `UPDATE customer_auth_otps SET verified_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [record.id]
     );
     await client.query(
       `UPDATE customer_auth_otps SET invalidated_at = CURRENT_TIMESTAMP
-       WHERE phone = $1 AND id <> $2 AND verified_at IS NULL AND invalidated_at IS NULL`,
+       WHERE phone = ? AND id <> ? AND verified_at IS NULL AND invalidated_at IS NULL`,
       [phone, record.id]
     );
     const tokenId = crypto.randomUUID();
     const expiresAt = customerSessionExpiry();
     await client.query(
       `INSERT INTO customer_sessions (token_id, phone, expires_at)
-       VALUES ($1, $2, $3)`,
+       VALUES (?, ?, ?)`,
       [tokenId, phone, expiresAt]
     );
+    await client.query("SELECT RELEASE_LOCK(?)", [lockName]).catch(() => {});
     await client.query("COMMIT");
 
     const token = signCustomerToken({ phone, tokenId });
@@ -369,7 +385,7 @@ async function loadProfile(phone) {
 export async function logoutCustomer(req, res) {
   await query(
     `UPDATE customer_sessions SET revoked_at = CURRENT_TIMESTAMP
-     WHERE token_id = $1 AND phone = $2 AND revoked_at IS NULL`,
+     WHERE token_id = ? AND phone = ? AND revoked_at IS NULL`,
     [req.customer.tokenId, req.customer.phone]
   );
   return res.status(200).json({ success: true, message: "Logged out successfully" });

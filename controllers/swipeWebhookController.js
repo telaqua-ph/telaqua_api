@@ -63,16 +63,16 @@ export async function handleSwipeWebhook(req, res) {
     await query(
       `UPDATE orders
        SET
-         swipe_invoice_id = COALESCE(swipe_invoice_id, $1),
-         invoice_number = COALESCE(invoice_number, $2),
+         swipe_invoice_id = COALESCE(swipe_invoice_id, ?),
+         invoice_number = COALESCE(invoice_number, ?),
          invoice_generated_at = COALESCE(invoice_generated_at, CURRENT_TIMESTAMP),
          invoice_status = CASE
            WHEN invoice_status = 'generated' THEN invoice_status
            ELSE 'generated'
          END,
          updated_at = CURRENT_TIMESTAMP
-       WHERE swipe_invoice_id = $1
-          OR invoice_number = $2`,
+       WHERE swipe_invoice_id = ?
+          OR invoice_number = ?`,
       [hashId, serialNumber]
     );
 

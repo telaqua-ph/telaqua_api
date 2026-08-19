@@ -44,7 +44,7 @@ export async function login(req, res) {
     const { rows } = await query(
       `SELECT id, full_name, username, email, password_hash
        FROM admins
-       WHERE email = $1
+       WHERE email = ?
          AND is_active = true
        LIMIT 1`,
       [email]
@@ -70,7 +70,7 @@ export async function login(req, res) {
     await query(
       `UPDATE admins
        SET last_login = CURRENT_TIMESTAMP
-       WHERE id = $1`,
+       WHERE id = ?`,
       [admin.id]
     );
 
@@ -112,7 +112,7 @@ export async function getProfile(req, res) {
     const { rows } = await query(
       `SELECT id, full_name, username, email, is_active, last_login, created_at, updated_at
        FROM admins
-       WHERE id = $1
+       WHERE id = ?
          AND is_active = true
        LIMIT 1`,
       [adminId]
@@ -190,7 +190,7 @@ export async function updateProfile(req, res) {
 
     const { rows: existing } = await query(
       `SELECT id FROM admins
-       WHERE id = $1
+       WHERE id = ?
          AND is_active = true
        LIMIT 1`,
       [adminId]
@@ -206,8 +206,8 @@ export async function updateProfile(req, res) {
     if (email !== undefined) {
       const { rows: taken } = await query(
         `SELECT id FROM admins
-         WHERE email = $1
-           AND id <> $2
+         WHERE email = ?
+           AND id <> ?
          LIMIT 1`,
         [email, adminId]
       );
@@ -219,15 +219,20 @@ export async function updateProfile(req, res) {
       }
     }
 
-    const { rows } = await query(
+    await query(
       `UPDATE admins
        SET
-         full_name = COALESCE($1, full_name),
-         email = COALESCE($2, email),
+         full_name = COALESCE(?, full_name),
+         email = COALESCE(?, email),
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $3
-       RETURNING id, full_name, username, email, is_active, last_login, created_at, updated_at`,
+       WHERE id = ?`,
       [full_name ?? null, email ?? null, adminId]
+    );
+
+    const { rows } = await query(
+      `SELECT id, full_name, username, email, is_active, last_login, created_at, updated_at
+       FROM admins WHERE id = ? LIMIT 1`,
+      [adminId]
     );
 
     return res.status(200).json({
@@ -295,7 +300,7 @@ export async function changePassword(req, res) {
     const { rows } = await query(
       `SELECT id, password_hash
        FROM admins
-       WHERE id = $1
+       WHERE id = ?
          AND is_active = true
        LIMIT 1`,
       [adminId]
@@ -323,9 +328,9 @@ export async function changePassword(req, res) {
     await query(
       `UPDATE admins
        SET
-         password_hash = $1,
+         password_hash = ?,
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
+       WHERE id = ?`,
       [password_hash, adminId]
     );
 

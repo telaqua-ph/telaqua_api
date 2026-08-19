@@ -1,39 +1,14 @@
 /**
- * Apply admin order-views schema to Neon/PostgreSQL.
+ * DEPRECATED: Legacy Neon/PostgreSQL migration helper.
+ * Hostinger MySQL schema is maintained separately; do not run PostgreSQL DDL here.
+ *
  * Usage: node scripts/migrate-order-views.js
  */
 
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import dotenv from "dotenv";
-import pg from "pg";
-
-dotenv.config();
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const sqlPath = path.join(__dirname, "..", "sql", "add_order_views.sql");
-
-async function main() {
-  const connectionString = process.env.DATABASE_URL?.trim();
-  if (!connectionString) {
-    console.error("DATABASE_URL is required");
-    process.exit(1);
-  }
-
-  const sql = fs.readFileSync(sqlPath, "utf8");
-  const client = new pg.Client({ connectionString, ssl: { rejectUnauthorized: false } });
-
-  try {
-    await client.connect();
-    await client.query(sql);
-    console.log("Order views migration applied successfully.");
-  } catch (err) {
-    console.error("Order views migration failed:", err?.message);
-    process.exit(1);
-  } finally {
-    await client.end();
-  }
-}
-
-main();
+console.error(
+  "migrate-order-views.js is deprecated. Order-view tables already exist on Hostinger MySQL."
+);
+console.error(
+  "See sql/add_order_views.sql for historical PostgreSQL reference DDL only."
+);
+process.exit(0);
